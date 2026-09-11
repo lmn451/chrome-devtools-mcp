@@ -8,8 +8,8 @@ import type fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 
+import {BrowserManager} from './browser.js';
 import type {Channel} from './browser.js';
-import {ensureBrowserConnected, ensureBrowserLaunched} from './browser.js';
 import {type ParsedArguments} from './config/mcp-options.js';
 import {loadIssueDescriptions} from './devtools/issueDescriptions.js';
 import {McpContext} from './McpContext.js';
@@ -46,12 +46,14 @@ const ROOTS_REQUEST_TIMEOUT = 5_000;
 
 export interface McpServerOptions {
   logFile?: fs.WriteStream;
+  browserManager?: BrowserManager;
 }
 
 export class McpServer {
   readonly server: SdkMcpServer;
   #serverArgs: ParsedArguments;
   #options: McpServerOptions;
+  #browserManager: BrowserManager;
   #context?: McpContext;
 
   /**
@@ -68,6 +70,7 @@ export class McpServer {
   ) {
     this.#serverArgs = serverArgs;
     this.#options = options;
+    this.#browserManager = options.browserManager ?? new BrowserManager();
 
     if (this.#serverArgs.usageStatistics) {
       ClearcutLogger.initialize({
@@ -131,7 +134,11 @@ export class McpServer {
   async close(): Promise<void> {
     this.#context?.dispose();
     this.#context = undefined;
-    await this.server.close();
+    try {
+      await this.server.close();
+    } finally {
+      await this.#browserManager.closeBrowser();
+    }
   }
 
   [Symbol.dispose](): void {
@@ -223,7 +230,7 @@ export class McpServer {
       this.#serverArgs.browserUrl ||
       this.#serverArgs.wsEndpoint ||
       this.#serverArgs.autoConnect
-        ? await ensureBrowserConnected({
+        ? await this.#browserManager.ensureBrowserConnected({
             browserURL: this.#serverArgs.browserUrl,
             wsEndpoint: this.#serverArgs.wsEndpoint,
             wsHeaders: this.#serverArgs.wsHeaders,
@@ -234,7 +241,7 @@ export class McpServer {
             blocklist,
             allowlist,
           })
-        : await ensureBrowserLaunched({
+        : await this.#browserManager.ensureBrowserLaunched({
             headless: this.#serverArgs.headless,
             executablePath: this.#serverArgs.executablePath,
             channel,
