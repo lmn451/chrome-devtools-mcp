@@ -5,18 +5,28 @@
  */
 
 import assert from 'node:assert';
+import http from 'node:http';
 import {afterEach, describe, it} from 'node:test';
 
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
+import {executablePath} from 'puppeteer';
+
 import {parseArguments} from '../src/config/mcp-options.js';
 import {McpHttpServer} from '../src/McpHttpServer.js';
 
-function testArgs() {
+function testArgs(extraArgs: string[] = []) {
   return parseArguments(
     '0.0.0',
-    ['node', 'test', '--headless', '--isolated', '--no-usage-statistics'],
+    [
+      'node',
+      'test',
+      '--headless',
+      '--isolated',
+      '--no-usage-statistics',
+      ...extraArgs,
+    ],
     {},
   );
 }
@@ -135,6 +145,127 @@ describe('McpHttpServer', () => {
     await response.text();
 
     assert.strictEqual(response.status, 404);
+  });
+
+  it('reports status on /health', async () => {
+    server = await McpHttpServer.start(testArgs(), {port: 0});
+
+    const response = await fetch(`http://127.0.0.1:${server.port}/health`);
+    const text = await response.text();
+
+    assert.strictEqual(response.status, 200);
+    assert.ok(text.includes('"status":"ok"'));
+    assert.ok(text.includes('"mcpSessions":0'));
+    assert.ok(text.includes('"browserConnected":false'));
+  });
+
+  it('rejects foreign Host headers outside /mcp', async () => {
+    server = await McpHttpServer.start(testArgs(), {port: 0});
+
+    const statusCode = await new Promise((resolve, reject) => {
+      const request = http.request(
+        {
+          host: '127.0.0.1',
+          port: server?.port,
+          path: '/health',
+          headers: {Host: 'evil.example'},
+        },
+        response => {
+          response.resume();
+          resolve(response.statusCode);
+        },
+      );
+      request.on('error', reject);
+      request.end();
+    });
+
+    assert.strictEqual(statusCode, 403);
+  });
+
+  it('lists tools over the REST facade', async () => {
+    server = await McpHttpServer.start(testArgs(), {port: 0});
+
+    const response = await fetch(`http://127.0.0.1:${server.port}/api/tools`);
+    const text = await response.text();
+
+    assert.strictEqual(response.status, 200);
+    assert.ok(text.includes('"list_pages"'));
+    assert.ok(text.includes('"inputSchema"'));
+    assert.strictEqual(server.apiSessionCount, 1);
+  });
+
+  it('rejects invalid REST tool calls', async () => {
+    server = await McpHttpServer.start(testArgs(), {port: 0});
+    const base = `http://127.0.0.1:${server.port}/api/tools`;
+
+    const unknownTool = await fetch(`${base}/does_not_exist`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: '{}',
+    });
+    await unknownTool.text();
+    assert.strictEqual(unknownTool.status, 404);
+
+    const badArgs = await fetch(`${base}/list_pages`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: '[1,2]',
+    });
+    await badArgs.text();
+    assert.strictEqual(badArgs.status, 400);
+
+    const badSession = await fetch(`${base}/list_pages?session=bad/name`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: '{}',
+    });
+    await badSession.text();
+    assert.strictEqual(badSession.status, 400);
+  });
+
+  it('calls tools over the REST facade with a shared browser', async () => {
+    server = await McpHttpServer.start(
+      testArgs(['--executable-path', await executablePath()]),
+      {port: 0},
+    );
+    const base = `http://127.0.0.1:${server.port}/api/tools`;
+
+    const newPage = await fetch(`${base}/new_page`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({url: 'about:blank?from-rest'}),
+    });
+    const newPageText = await newPage.text();
+    assert.strictEqual(newPage.status, 200);
+    assert.ok(!newPageText.includes('"isError":true'));
+
+    // A different named REST session sees the same browser.
+    const listPages = await fetch(`${base}/list_pages?session=other`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+    });
+    const listPagesText = await listPages.text();
+    assert.strictEqual(listPages.status, 200);
+    assert.ok(listPagesText.includes('from-rest'));
+    assert.strictEqual(server.apiSessionCount, 2);
+  });
+
+  it('evicts idle sessions after the configured timeout', async () => {
+    server = await McpHttpServer.start(
+      testArgs(['--http-port', '0', '--http-session-timeout', '1']),
+      {port: 0},
+    );
+    const activeServer = server;
+
+    const a = await connectClient(server.url);
+    assert.strictEqual(server.sessionCount, 1);
+
+    await waitFor(() => activeServer.sessionCount === 0, 5_000);
+
+    await assert.rejects(async () => {
+      await a.client.listTools();
+    });
+    await a.client.close();
   });
 
   it('closes all sessions on close', async () => {

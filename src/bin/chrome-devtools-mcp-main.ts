@@ -84,7 +84,8 @@ if (args.httpPort !== undefined) {
   });
   server = httpServer;
   console.error(
-    `chrome-devtools-mcp: MCP endpoint listening on ${httpServer.url}`,
+    `chrome-devtools-mcp: MCP endpoint listening on ${httpServer.url} ` +
+      `(health: /health, REST tools: /api/tools)`,
   );
   logger?.(`Chrome DevTools MCP Server listening on ${httpServer.url}`);
 } else {

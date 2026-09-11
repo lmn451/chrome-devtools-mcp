@@ -36,6 +36,23 @@ export const mcpOptions = {
       return value;
     },
   },
+  httpSessionTimeout: {
+    type: 'number',
+    describe:
+      'Evict an HTTP MCP session after this many seconds without a request from its client. By default sessions are kept until the client terminates them or the server exits. Only applies with --http-port.',
+    implies: 'httpPort',
+    coerce: (value: number | undefined) => {
+      if (value === undefined) {
+        return;
+      }
+      if (!Number.isInteger(value) || value < 0) {
+        throw new Error(
+          `Provided httpSessionTimeout ${value} is not a non-negative integer.`,
+        );
+      }
+      return value;
+    },
+  },
   viewport: {
     type: 'string',
     describe:

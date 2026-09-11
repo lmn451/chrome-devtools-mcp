@@ -287,6 +287,10 @@ export class BrowserManager {
     });
   }
 
+  get connected(): boolean {
+    return this.#browser?.connected === true;
+  }
+
   async #ensureBrowser(start: () => Promise<Browser>): Promise<Browser> {
     const existingBrowser = this.#browser;
     if (existingBrowser?.connected) {
