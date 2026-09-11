@@ -18,7 +18,6 @@ import {puppeteer} from './third_party/index.js';
 import {logger, puppeteerLogger} from './utils/logger.js';
 import {isAllowedUrl} from './utils/url.js';
 
-
 export function makeTargetFilter(enableExtensions = false) {
   return function targetFilter(target: {url(): string}): boolean {
     const url = target.url();
@@ -41,7 +40,9 @@ export interface BrowserConnectionOptions {
   allowlist?: string[];
 }
 
-async function connectBrowser(options: BrowserConnectionOptions): Promise<Browser> {
+async function connectBrowser(
+  options: BrowserConnectionOptions,
+): Promise<Browser> {
   const {channel, enableExtensions} = options;
   const connectOptions: Parameters<typeof puppeteer.connect>[0] = {
     targetFilter: makeTargetFilter(enableExtensions),
@@ -255,33 +256,48 @@ export async function launch(options: McpLaunchOptions): Promise<Browser> {
 export class BrowserManager {
   #browser: Browser | undefined;
   #browserMode: 'launched' | 'connected' | undefined;
+  /**
+   * In-flight connect/launch. Several MCP sessions can share one manager, so
+   * concurrent first tool calls must not each start their own Chrome: the
+   * first caller starts the browser and the rest await the same promise.
+   */
+  #pendingBrowser: Promise<Browser> | undefined;
 
   async ensureBrowserConnected(
     options: BrowserConnectionOptions,
   ): Promise<Browser> {
-    const existingBrowser = this.#browser;
-    if (existingBrowser?.connected) {
-      return existingBrowser;
-    }
-    const connected = await connectBrowser(options);
-    // Assign mode before browser so a concurrent closeBrowser() never sees
-    // `browser` set with `browserMode` still undefined (would fall through
-    // to the disconnect() path and orphan a launched Chrome).
-    this.#browserMode = 'connected';
-    this.#browser = connected;
-    return connected;
+    return await this.#ensureBrowser(async () => {
+      const connected = await connectBrowser(options);
+      // Assign mode before browser so a concurrent closeBrowser() never sees
+      // `browser` set with `browserMode` still undefined (would fall through
+      // to the disconnect() path and orphan a launched Chrome).
+      this.#browserMode = 'connected';
+      this.#browser = connected;
+      return connected;
+    });
   }
 
   async ensureBrowserLaunched(options: McpLaunchOptions): Promise<Browser> {
+    return await this.#ensureBrowser(async () => {
+      // Assign mode before browser; see the connect path above for rationale.
+      const launched = await launch(options);
+      this.#browserMode = 'launched';
+      this.#browser = launched;
+      return launched;
+    });
+  }
+
+  async #ensureBrowser(start: () => Promise<Browser>): Promise<Browser> {
     const existingBrowser = this.#browser;
     if (existingBrowser?.connected) {
       return existingBrowser;
     }
-    // Assign mode before browser; see the connect path above for rationale.
-    const launched = await launch(options);
-    this.#browserMode = 'launched';
-    this.#browser = launched;
-    return launched;
+    if (!this.#pendingBrowser) {
+      this.#pendingBrowser = start().finally(() => {
+        this.#pendingBrowser = undefined;
+      });
+    }
+    return await this.#pendingBrowser;
   }
 
   /**
@@ -321,7 +337,7 @@ export async function ensureBrowserConnected(
 
 export async function ensureBrowserLaunched(
   options: McpLaunchOptions,
-  ): Promise<Browser> {
+): Promise<Browser> {
   return await defaultBrowserManager.ensureBrowserLaunched(options);
 }
 

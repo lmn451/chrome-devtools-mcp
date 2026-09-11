@@ -22,6 +22,20 @@ export const mcpOptions = {
     describe:
       'Path to a file to write debug logs to. Set the env variable `DEBUG` to `*` to enable verbose logs. Useful for submitting bug reports.',
   },
+  httpPort: {
+    type: 'number',
+    describe:
+      'Serve MCP over the streamable HTTP transport on this 127.0.0.1 port instead of stdio. One server process drives one browser while any number of MCP clients connect concurrently, each in its own session. Use 0 to let the OS pick a free port.',
+    coerce: (value: number | undefined) => {
+      if (value === undefined) {
+        return;
+      }
+      if (!Number.isInteger(value) || value < 0 || value > 65535) {
+        throw new Error(`Provided httpPort ${value} is not a valid port.`);
+      }
+      return value;
+    },
+  },
   viewport: {
     type: 'string',
     describe:

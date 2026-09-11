@@ -100,6 +100,11 @@ The Chrome DevTools MCP server supports the following configuration option:
   - **Type:** string
   - **Default:** `false`
 
+- **`--httpPort`/ `--http-port`**
+  Serve MCP over the streamable HTTP transport on this 127.0.0.1 port instead of stdio. One server process drives one browser while any number of MCP clients connect concurrently, each in its own session. Use 0 to let the OS pick a free port.
+  - **Type:** number
+  - **Default:** `false`
+
 - **`--viewport`**
   Initial viewport size for the Chrome instances started by the server. For example, `1280x720`. In headless mode, max size is 3840x2160px.
   - **Type:** string

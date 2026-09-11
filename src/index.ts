@@ -54,6 +54,12 @@ export class McpServer {
   #serverArgs: ParsedArguments;
   #options: McpServerOptions;
   #browserManager: BrowserManager;
+  /**
+   * Whether this server created its own BrowserManager. An injected manager
+   * is shared with other servers (one browser, many clients), so its
+   * lifecycle belongs to whoever injected it.
+   */
+  #ownsBrowserManager: boolean;
   #context?: McpContext;
 
   /**
@@ -71,8 +77,11 @@ export class McpServer {
     this.#serverArgs = serverArgs;
     this.#options = options;
     this.#browserManager = options.browserManager ?? new BrowserManager();
+    this.#ownsBrowserManager = options.browserManager === undefined;
 
-    if (this.#serverArgs.usageStatistics) {
+    // The logger is a process-wide singleton; with several servers in one
+    // process (HTTP sessions) only the first one initializes it.
+    if (this.#serverArgs.usageStatistics && !ClearcutLogger.get()) {
       ClearcutLogger.initialize({
         persistence: new FilePersistence(),
         logFile: this.#serverArgs.logFile,
@@ -137,7 +146,9 @@ export class McpServer {
     try {
       await this.server.close();
     } finally {
-      await this.#browserManager.closeBrowser();
+      if (this.#ownsBrowserManager) {
+        await this.#browserManager.closeBrowser();
+      }
     }
   }
 
