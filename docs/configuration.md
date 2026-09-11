@@ -105,6 +105,11 @@ The Chrome DevTools MCP server supports the following configuration option:
   - **Type:** number
   - **Default:** `false`
 
+- **`--httpSessionTimeout`/ `--http-session-timeout`**
+  Evict an HTTP MCP session after this many seconds without a request from its client. By default sessions are kept until the client terminates them or the server exits. Only applies with --http-port.
+  - **Type:** number
+  - **Default:** `false`
+
 - **`--viewport`**
   Initial viewport size for the Chrome instances started by the server. For example, `1280x720`. In headless mode, max size is 3840x2160px.
   - **Type:** string
