@@ -18,9 +18,6 @@ import {puppeteer} from './third_party/index.js';
 import {logger, puppeteerLogger} from './utils/logger.js';
 import {isAllowedUrl} from './utils/url.js';
 
-let browser: Browser | undefined;
-let browserMode: 'launched' | 'connected' | undefined;
-
 export function makeTargetFilter(enableExtensions = false) {
   return function targetFilter(target: {url(): string}): boolean {
     const url = target.url();
@@ -31,7 +28,7 @@ export function makeTargetFilter(enableExtensions = false) {
   };
 }
 
-export async function ensureBrowserConnected(options: {
+export interface BrowserConnectionOptions {
   browserURL?: string;
   wsEndpoint?: string;
   wsHeaders?: Record<string, string>;
@@ -41,12 +38,12 @@ export async function ensureBrowserConnected(options: {
   enableExtensions?: boolean;
   blocklist?: string[];
   allowlist?: string[];
-}) {
-  const {channel, enableExtensions} = options;
-  if (browser?.connected) {
-    return browser;
-  }
+}
 
+async function connectBrowser(
+  options: BrowserConnectionOptions,
+): Promise<Browser> {
+  const {channel, enableExtensions} = options;
   const connectOptions: Parameters<typeof puppeteer.connect>[0] = {
     targetFilter: makeTargetFilter(enableExtensions),
     defaultViewport: null,
@@ -113,12 +110,7 @@ export async function ensureBrowserConnected(options: {
 
   logger?.('Connecting Puppeteer to ', JSON.stringify(connectOptions));
   try {
-    // Assign mode before browser so a concurrent closeBrowser() never sees
-    // `browser` set with `browserMode` still undefined (would fall through
-    // to the disconnect() path and orphan a launched Chrome).
-    const connected = await puppeteer.connect(connectOptions);
-    browserMode = 'connected';
-    browser = connected;
+    return await puppeteer.connect(connectOptions);
   } catch (err) {
     throw new Error(
       `Could not connect to Chrome. ${autoConnect ? `Check if Chrome is running and remote debugging is enabled by going to chrome://inspect/#remote-debugging.` : `Check if Chrome is running.`}`,
@@ -127,8 +119,6 @@ export async function ensureBrowserConnected(options: {
       },
     );
   }
-  logger?.('Connected Puppeteer');
-  return browser;
 }
 
 interface McpLaunchOptions {
@@ -263,43 +253,100 @@ export async function launch(options: McpLaunchOptions): Promise<Browser> {
   }
 }
 
+export class BrowserManager {
+  #browser: Browser | undefined;
+  #browserMode: 'launched' | 'connected' | undefined;
+  /**
+   * In-flight connect/launch. Several MCP sessions can share one manager, so
+   * concurrent first tool calls must not each start their own Chrome: the
+   * first caller starts the browser and the rest await the same promise.
+   */
+  #pendingBrowser: Promise<Browser> | undefined;
+
+  async ensureBrowserConnected(
+    options: BrowserConnectionOptions,
+  ): Promise<Browser> {
+    return await this.#ensureBrowser(async () => {
+      const connected = await connectBrowser(options);
+      // Assign mode before browser so a concurrent closeBrowser() never sees
+      // `browser` set with `browserMode` still undefined (would fall through
+      // to the disconnect() path and orphan a launched Chrome).
+      this.#browserMode = 'connected';
+      this.#browser = connected;
+      return connected;
+    });
+  }
+
+  async ensureBrowserLaunched(options: McpLaunchOptions): Promise<Browser> {
+    return await this.#ensureBrowser(async () => {
+      // Assign mode before browser; see the connect path above for rationale.
+      const launched = await launch(options);
+      this.#browserMode = 'launched';
+      this.#browser = launched;
+      return launched;
+    });
+  }
+
+  get connected(): boolean {
+    return this.#browser?.connected === true;
+  }
+
+  async #ensureBrowser(start: () => Promise<Browser>): Promise<Browser> {
+    const existingBrowser = this.#browser;
+    if (existingBrowser?.connected) {
+      return existingBrowser;
+    }
+    if (!this.#pendingBrowser) {
+      this.#pendingBrowser = start().finally(() => {
+        this.#pendingBrowser = undefined;
+      });
+    }
+    return await this.#pendingBrowser;
+  }
+
+  /**
+   * Shutdown hook for the active browser. Closes a launched browser (so the
+   * Chrome subprocess is reaped) or disconnects from an attached browser (so
+   * the user's Chrome instance stays alive). No-op if no browser is active or
+   * the connection has already been dropped.
+   */
+  async closeBrowser(): Promise<void> {
+    const activeBrowser = this.#browser;
+    const mode = this.#browserMode;
+    this.#browser = undefined;
+    this.#browserMode = undefined;
+    if (!activeBrowser || !activeBrowser.connected) {
+      return;
+    }
+    if (mode === 'launched') {
+      await activeBrowser.close().catch(err => {
+        logger?.('Failed to close browser', err);
+      });
+      return;
+    }
+    await activeBrowser.disconnect().catch(err => {
+      logger?.('Failed to disconnect from browser', err);
+    });
+  }
+}
+
+// Keep the legacy module-level API for stdio integrations and existing tests.
+const defaultBrowserManager = new BrowserManager();
+
+export async function ensureBrowserConnected(
+  options: BrowserConnectionOptions,
+): Promise<Browser> {
+  return await defaultBrowserManager.ensureBrowserConnected(options);
+}
+
 export async function ensureBrowserLaunched(
   options: McpLaunchOptions,
 ): Promise<Browser> {
-  if (browser?.connected) {
-    return browser;
-  }
-  // Assign mode before browser; see the connect path above for rationale.
-  const launched = await launch(options);
-  browserMode = 'launched';
-  browser = launched;
-  return browser;
+  return await defaultBrowserManager.ensureBrowserLaunched(options);
 }
 
-/**
- * Shutdown hook for the active browser. Closes a launched browser (so the
- * Chrome subprocess is reaped) or disconnects from an attached browser (so
- * the user's Chrome instance stays alive). No-op if no browser is active or
- * the connection has already been dropped. Called from the server entrypoint
- * on stdin EOF / SIGTERM / SIGINT.
- */
 export async function closeBrowser(): Promise<void> {
-  const b = browser;
-  const mode = browserMode;
-  browser = undefined;
-  browserMode = undefined;
-  if (!b || !b.connected) {
-    return;
-  }
-  if (mode === 'launched') {
-    await b.close().catch(err => {
-      logger?.('Failed to close browser', err);
-    });
-    return;
-  }
-  await b.disconnect().catch(err => {
-    logger?.('Failed to disconnect from browser', err);
-  });
+  await defaultBrowserManager.closeBrowser();
 }
 
 export type Channel = 'stable' | 'canary' | 'beta' | 'dev';

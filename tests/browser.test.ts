@@ -12,6 +12,7 @@ import {describe, it} from 'node:test';
 import {executablePath} from 'puppeteer';
 
 import {
+  BrowserManager,
   detectDisplay,
   ensureBrowserConnected,
   launch,
@@ -92,6 +93,35 @@ describe('browser', () => {
             `The browser is already running for ${folderPath}. Use --isolated to run multiple browser instances.`,
           );
         }
+      } finally {
+        await safeClose(browser1);
+      }
+    });
+  });
+
+  it('shares one launch across concurrent ensure calls', async () => {
+    await runWithRetry(async () => {
+      const tmpDir = os.tmpdir();
+      const folderPath = path.join(
+        tmpDir,
+        `temp-folder-${crypto.randomUUID()}`,
+      );
+      const manager = new BrowserManager();
+      const options = {
+        headless: true,
+        isolated: false,
+        userDataDir: folderPath,
+        executablePath: await executablePath(),
+        devtools: false,
+      };
+      // Two sessions racing on the first tool call must end up with the
+      // same browser instead of launching twice into the same profile.
+      const [browser1, browser2] = await Promise.all([
+        manager.ensureBrowserLaunched(options),
+        manager.ensureBrowserLaunched(options),
+      ]);
+      try {
+        assert.strictEqual(browser1, browser2);
       } finally {
         await safeClose(browser1);
       }

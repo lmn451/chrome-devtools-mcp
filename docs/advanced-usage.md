@@ -28,6 +28,94 @@ launch its own temporary Chrome profile, also pass `--isolated`. This avoids
 sharing the default Chrome DevTools MCP user data directory between those
 server instances.
 
+## One server, many clients (HTTP mode)
+
+By default the server speaks MCP over stdio: one client, one server process,
+one browser. With `--http-port` a single server process instead serves MCP
+over the streamable HTTP transport, and any number of MCP clients can connect
+concurrently while sharing one browser:
+
+```bash
+npx chrome-devtools-mcp@latest --http-port 8000
+```
+
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}
+```
+
+Each MCP client gets its own session (own selected page, console and network
+history, and roots) identified by the `mcp-session-id` header, while all
+sessions drive the same Chrome instance. Sessions survive client reconnects
+until the client terminates them (HTTP `DELETE`), they are evicted as idle
+(see below), or the server exits. All connect options work as usual: pass
+`--browser-url`, `--ws-endpoint`, or `--auto-connect` to share a running
+Chrome instance instead of launching one.
+
+The server binds to `127.0.0.1` and validates `Host` headers against a
+localhost allowlist (DNS rebinding protection). There is no authentication:
+any local process can drive the shared browser, so only use HTTP mode on
+machines where that is acceptable.
+
+### Health endpoint
+
+`GET /health` reports server status for scripts and process managers:
+
+```bash
+curl http://127.0.0.1:8000/health
+# {"status":"ok","version":"1.9.0","uptimeSeconds":42,"mcpSessions":2,"apiSessions":1,"browserConnected":true}
+```
+
+### REST tool calls
+
+For plain HTTP callers (shell scripts, fetch/axios, or agent-native CLI
+wrappers) the server also exposes tool calls as REST endpoints, with no MCP
+handshake, session header, or SSE parsing:
+
+```bash
+# List tools and their input schemas
+curl http://127.0.0.1:8000/api/tools
+
+# Call a tool; the body is the tool's arguments as a JSON object
+curl -X POST http://127.0.0.1:8000/api/tools/new_page \
+  -H 'content-type: application/json' \
+  -d '{"url": "https://example.com"}'
+
+curl -X POST http://127.0.0.1:8000/api/tools/take_snapshot
+```
+
+REST calls run through a named server-side MCP session (`?session=<name>`,
+default `default`) that keeps tool state between invocations, so consecutive
+CLI or script calls behave like one continuous MCP session. Use different
+session names to keep independent tool states over the same browser:
+
+```bash
+curl -X POST 'http://127.0.0.1:8000/api/tools/list_pages?session=agent-2'
+```
+
+Responses are MCP `CallToolResult` JSON: tool execution errors return HTTP
+200 with `"isError": true`, unknown tools return 404, and invalid arguments
+or session names return 400.
+
+### Idle session eviction
+
+Long-running servers can evict sessions whose clients disappeared without
+terminating them:
+
+```bash
+npx chrome-devtools-mcp@latest --http-port 8000 --http-session-timeout 1800
+```
+
+A session (MCP or REST) idle for longer than the configured number of seconds
+is closed. The shared browser stays up; an evicted MCP client re-initializes
+on its next request, and an evicted REST session is recreated on demand.
+
 ## User data directory
 
 By default, `chrome-devtools-mcp` starts a Chrome's stable channel instance using the following user
