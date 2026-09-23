@@ -6,35 +6,21 @@
 
 import assert from 'node:assert';
 import {describe, it} from 'node:test';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
+import {buildCommand} from '../src/config/cli-commands.js';
+import {commands} from '../src/config/cli-options.js';
 import {
   DEFAULT_FILESYSTEM_ROOT,
   mcpOptions,
   parser,
 } from '../src/config/mcp-options.js';
 
+import {createTempFile} from './utils.js';
+
 function parseArguments(argv: string[], env: NodeJS.ProcessEnv = {}) {
   return parser('0.0.0', ['node', 'main.js', ...argv], env)
     .exitProcess(false)
     .parseSync();
-}
-
-function createTempFile(content: string, fileName: string) {
-  const filePath = path.join(os.tmpdir(), fileName);
-  fs.writeFileSync(filePath, content);
-  return {
-    path: filePath,
-    [Symbol.dispose]() {
-      try {
-        fs.unlinkSync(filePath);
-      } catch {
-        // ignore
-      }
-    },
-  };
 }
 
 describe('cli args parsing', () => {
@@ -487,6 +473,34 @@ describe('cli args parsing', () => {
     assert.strictEqual(args.categoryMemory, true);
   });
 
+  it('applies config coercion for viewport and wsHeaders', async () => {
+    using testConfig = createTempFile(
+      JSON.stringify({
+        wsEndpoint: 'ws://127.0.0.1:9222/devtools/browser/abc123',
+        wsHeaders: '{"Authorization":"Bearer token"}',
+        viewport: '1280x720',
+      }),
+      'cd4a.test.config.coercion.json',
+    );
+    const args = parseArguments(['--config', testConfig.path]);
+    assert.deepStrictEqual(args.viewport, {width: 1280, height: 720});
+    assert.deepStrictEqual(args.wsHeaders, {Authorization: 'Bearer token'});
+  });
+
+  it('lets cli options override coerced config values', async () => {
+    using testConfig = createTempFile(
+      JSON.stringify({viewport: '1280x720'}),
+      'cd4a.test.config.coercion-override.json',
+    );
+    const args = parseArguments([
+      '--config',
+      testConfig.path,
+      '--viewport',
+      '800x600',
+    ]);
+    assert.deepStrictEqual(args.viewport, {width: 800, height: 600});
+  });
+
   it('parses config should not allow no prefix', async () => {
     using testConfig = createTempFile(
       JSON.stringify({
@@ -518,5 +532,56 @@ describe('cli args parsing', () => {
   it('parses with devtoolsComments enabled', async () => {
     const args = parseArguments(['--devtoolsComments']);
     assert.strictEqual(args.devtoolsComments, true);
+  });
+});
+
+describe('cli command strings', () => {
+  it('renders a required array arg as a variadic positional', () => {
+    const {command} = buildCommand('upload_file', commands['upload_file'].args);
+    assert.strictEqual(command, 'upload_file <pageId> <uid> <filePaths..>');
+  });
+
+  it('renders required non-array args as plain positionals', () => {
+    const {command} = buildCommand('click', commands['click'].args);
+    assert.strictEqual(command, 'click <pageId> <uid>');
+  });
+
+  it('lists optional args in the usage line, not the command', () => {
+    const {command, usage} = buildCommand(
+      'upload_file',
+      commands['upload_file'].args,
+    );
+    assert.ok(!command.includes('--'));
+    assert.ok(usage.startsWith(`$0 ${command} `));
+    assert.ok(usage.includes('[--includeSnapshot]'));
+  });
+
+  it('keeps every generated command parsable by yargs', () => {
+    for (const [name, {args}] of Object.entries(commands)) {
+      const {command} = buildCommand(name, args);
+
+      // A `[--flag]` token in the command string is parsed as a positional.
+      assert.ok(
+        !command.includes('--'),
+        `${name}: optional args must not be in the command string`,
+      );
+
+      // yargs only allows a variadic positional as the last one.
+      const variadic = command.indexOf('..>');
+      assert.ok(
+        variadic === -1 || variadic === command.length - 3,
+        `${name}: a variadic positional must be last`,
+      );
+
+      // A required array arg the daemon receives as a string fails validation.
+      for (const [argName, arg] of Object.entries(args)) {
+        if (arg.required && arg.type === 'array') {
+          assert.ok(
+            command.includes(`<${argName}..>`),
+            `${name}: required array arg ${argName} must be variadic`,
+          );
+        }
+      }
+    }
   });
 });

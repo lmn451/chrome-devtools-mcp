@@ -16,10 +16,12 @@ import {
   bucketizeDaysSince,
   bucketizeLatency,
   buildContext,
+  sanitizeClientName,
   sanitizeParams,
   stripUnderscoreBeforeNumber,
 } from './transformation.js';
 import {
+  type ChromeDevToolsMcpExtension,
   McpClient,
   type FlagUsage,
   WatchdogMessageType,
@@ -117,6 +119,7 @@ export class ClearcutLogger {
   #persistence: Persistence;
   #watchdog: WatchdogClient;
   #mcpClient: McpClient;
+  #rawClientName?: string;
   #state?: LocalState;
 
   static initialize(options: ClearcutLoggerOptions): ClearcutLogger {
@@ -163,6 +166,35 @@ export class ClearcutLogger {
 
   setClientName(clientName: string): void {
     this.#mcpClient = getMcpClient(clientName);
+    this.#rawClientName =
+      this.#mcpClient === McpClient.MCP_CLIENT_OTHER
+        ? sanitizeClientName(clientName)
+        : undefined;
+  }
+
+  #addMcpClient(
+    payload: ChromeDevToolsMcpExtension,
+    clientName?: string,
+  ): ChromeDevToolsMcpExtension {
+    const mcpClient =
+      clientName === undefined ? this.#mcpClient : getMcpClient(clientName);
+    const rawClientName =
+      clientName === undefined
+        ? this.#rawClientName
+        : sanitizeClientName(clientName);
+    const ext: ChromeDevToolsMcpExtension = {
+      ...payload,
+      mcp_client: mcpClient,
+    };
+    if (
+      mcpClient === McpClient.MCP_CLIENT_OTHER &&
+      rawClientName !== undefined
+    ) {
+      ext.raw_mcp_client_info = {
+        raw_client_name: rawClientName,
+      };
+    }
+    return ext;
   }
 
   async logToolInvocation(args: {
@@ -200,25 +232,18 @@ export class ClearcutLogger {
 
     this.#watchdog.send({
       type: WatchdogMessageType.LOG_EVENT,
-      payload: {
-        mcp_client:
-          args.clientName === undefined
-            ? this.#mcpClient
-            : getMcpClient(args.clientName),
-        tool_invocation: tool_invocation,
-      },
+      payload: this.#addMcpClient({tool_invocation}, args.clientName),
     });
   }
 
   async logServerStart(flagUsage: FlagUsage): Promise<void> {
     this.#watchdog.send({
       type: WatchdogMessageType.LOG_EVENT,
-      payload: {
-        mcp_client: this.#mcpClient,
+      payload: this.#addMcpClient({
         server_start: {
           flag_usage: flagUsage,
         },
-      },
+      }),
     });
   }
 
@@ -231,12 +256,11 @@ export class ClearcutLogger {
 
         this.#watchdog.send({
           type: WatchdogMessageType.LOG_EVENT,
-          payload: {
-            mcp_client: this.#mcpClient,
+          payload: this.#addMcpClient({
             daily_active: {
               days_since_last_active: bucketizeDaysSince(daysSince),
             },
-          },
+          }),
         });
 
         this.#state.lastActive = new Date().toISOString();
@@ -253,15 +277,14 @@ export class ClearcutLogger {
   }): Promise<void> {
     this.#watchdog.send({
       type: WatchdogMessageType.LOG_EVENT,
-      payload: {
-        mcp_client: this.#mcpClient,
+      payload: this.#addMcpClient({
         server_error: {
           tool_name: args.toolName
             ? stripUnderscoreBeforeNumber(args.toolName)
             : '',
           error_code: args.errorCode,
         },
-      },
+      }),
     });
   }
 
@@ -302,13 +325,14 @@ export class ClearcutLogger {
 
     this.#watchdog.send({
       type: WatchdogMessageType.LOG_EVENT,
-      payload: {
-        mcp_client:
-          clientName === undefined ? this.#mcpClient : getMcpClient(clientName),
-        tool_active: {
-          days_since_last_tool_call: bucketizeDaysSince(daysSinceToolCall),
+      payload: this.#addMcpClient(
+        {
+          tool_active: {
+            days_since_last_tool_call: bucketizeDaysSince(daysSinceToolCall),
+          },
         },
-      },
+        clientName,
+      ),
     });
 
     this.#state.lastToolCall = now.toISOString();

@@ -11,61 +11,14 @@ import {afterEach, describe, it} from 'node:test';
 
 import {executablePath} from 'puppeteer';
 import sinon from 'sinon';
+import {BrowserManager} from '../src/BrowserManager.js';
+import {puppeteer, type Browser} from '../src/third_party/index.js';
 
 import {
-  closeBrowser,
-  detectDisplay,
-  ensureBrowserConnected,
-  ensureBrowserLaunched,
-  launch,
-  makeTargetFilter,
-} from '../src/browser.js';
-import {Browser, puppeteer} from '../src/third_party/index.js';
-
+  createMockParsedArguments,
+  createMockPuppeteerBrowser,
+} from './mocks.js';
 import {serverHooks} from './server.js';
-
-interface Deferred<T> {
-  promise: Promise<T>;
-  resolve(value: T | PromiseLike<T>): void;
-  reject(reason?: unknown): void;
-}
-
-function createDeferred<T>(): Deferred<T> {
-  let resolvePromise = (_value: T | PromiseLike<T>): void => {
-    throw new Error('Deferred promise resolver was not initialized');
-  };
-  let rejectPromise = (_reason?: unknown): void => {
-    throw new Error('Deferred promise rejecter was not initialized');
-  };
-  const promise = new Promise<T>((resolve, reject) => {
-    resolvePromise = resolve;
-    rejectPromise = reject;
-  });
-  return {
-    promise,
-    resolve: value => resolvePromise(value),
-    reject: reason => rejectPromise(reason),
-  };
-}
-
-function createMockBrowser(): sinon.SinonStubbedInstance<Browser> {
-  const mockBrowser = sinon.createStubInstance(Browser);
-  Object.defineProperties(mockBrowser, {
-    connected: {
-      configurable: true,
-      value: true,
-    },
-    close: {
-      configurable: true,
-      value: sinon.stub().resolves(),
-    },
-    disconnect: {
-      configurable: true,
-      value: sinon.stub().resolves(),
-    },
-  });
-  return mockBrowser;
-}
 
 async function safeClose(browser: Browser) {
   try {
@@ -95,7 +48,7 @@ async function runWithRetry(fn: () => Promise<void>) {
       ]);
       return;
     } catch (e) {
-      lastError = e as Error;
+      lastError = e instanceof Error ? e : new Error(String(e));
       await new Promise(r => setTimeout(r, 500));
     }
   }
@@ -103,148 +56,298 @@ async function runWithRetry(fn: () => Promise<void>) {
 }
 
 describe('browser', () => {
-  afterEach(async () => {
-    await closeBrowser();
+  afterEach(() => {
     sinon.restore();
   });
 
   it('detects display does not crash', () => {
-    detectDisplay();
+    BrowserManager.detectDisplay();
   });
 
-  it('single-flights concurrent launches', async () => {
-    const deferred = createDeferred<Browser>();
-    const mockBrowser = createMockBrowser();
-    const launchStub = sinon.stub(puppeteer, 'launch');
-    launchStub.returns(deferred.promise);
+  describe('BrowserManager', () => {
+    it('launches a browser when no connect options are set and closes it on close()', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const launchStub = sinon.stub(puppeteer, 'launch').resolves(pptrBrowser);
+      const connectStub = sinon.stub(puppeteer, 'connect');
 
-    const options = {
-      headless: true,
-      isolated: true,
-      devtools: false,
-    };
-    const first = ensureBrowserLaunched(options);
-    const second = ensureBrowserLaunched(options);
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+        channel: 'canary',
+        proxyServer: 'http://localhost:8080',
+        chromeArg: ['--custom-arg'],
+      });
+      const manager = new BrowserManager(args);
 
-    sinon.assert.calledOnce(launchStub);
-    deferred.resolve(mockBrowser);
-    const [firstBrowser, secondBrowser] = await Promise.all([first, second]);
+      const browser1 = await manager.ensureBrowser();
+      const browser2 = await manager.ensureBrowser();
 
-    assert.strictEqual(firstBrowser, mockBrowser);
-    assert.strictEqual(secondBrowser, mockBrowser);
-  });
+      assert.strictEqual(browser1, pptrBrowser);
+      assert.strictEqual(browser2, pptrBrowser);
+      sinon.assert.calledOnce(launchStub);
+      sinon.assert.notCalled(connectStub);
+      sinon.assert.calledWithMatch(launchStub, {
+        channel: 'chrome-canary',
+        headless: true,
+        args: [
+          '--custom-arg',
+          '--proxy-server=http://localhost:8080',
+          '--hide-crash-restore-bubble',
+          '--screen-info={3840x2160}',
+        ],
+      });
 
-  it('single-flights concurrent browser connections', async () => {
-    const deferred = createDeferred<Browser>();
-    const mockBrowser = createMockBrowser();
-    const connectStub = sinon.stub(puppeteer, 'connect');
-    connectStub.returns(deferred.promise);
-
-    const options = {
-      browserURL: 'http://127.0.0.1:9222',
-      devtools: false,
-    };
-    const first = ensureBrowserConnected(options);
-    const second = ensureBrowserConnected(options);
-
-    sinon.assert.calledOnce(connectStub);
-    deferred.resolve(mockBrowser);
-    const [firstBrowser, secondBrowser] = await Promise.all([first, second]);
-
-    assert.strictEqual(firstBrowser, mockBrowser);
-    assert.strictEqual(secondBrowser, mockBrowser);
-  });
-
-  it('clears a failed launch acquisition before retrying', async () => {
-    const launchError = new Error('launch failed');
-    const mockBrowser = createMockBrowser();
-    const launchStub = sinon.stub(puppeteer, 'launch');
-    launchStub.onFirstCall().rejects(launchError);
-    launchStub.onSecondCall().resolves(mockBrowser);
-
-    const options = {
-      headless: true,
-      isolated: true,
-      devtools: false,
-    };
-    const first = ensureBrowserLaunched(options);
-    const second = ensureBrowserLaunched(options);
-
-    sinon.assert.calledOnce(launchStub);
-    await assert.rejects(first, /launch failed/);
-    await assert.rejects(second, /launch failed/);
-
-    const retry = await ensureBrowserLaunched(options);
-
-    assert.strictEqual(retry, mockBrowser);
-    sinon.assert.calledTwice(launchStub);
-  });
-
-  it('closes a launched browser acquired during shutdown', async () => {
-    const deferred = createDeferred<Browser>();
-    const mockBrowser = createMockBrowser();
-    const launchStub = sinon.stub(puppeteer, 'launch');
-    launchStub.returns(deferred.promise);
-
-    const acquisition = ensureBrowserLaunched({
-      headless: true,
-      isolated: true,
-      devtools: false,
+      await manager.close();
+      sinon.assert.calledOnceWithExactly(pptrBrowser.close);
+      sinon.assert.notCalled(pptrBrowser.disconnect);
     });
-    const shutdown = closeBrowser();
 
-    deferred.resolve(mockBrowser);
-    const [acquiredBrowser] = await Promise.all([acquisition, shutdown]);
+    it('connects to a browser when browserUrl is set and disconnects on close()', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const launchStub = sinon.stub(puppeteer, 'launch');
+      const connectStub = sinon
+        .stub(puppeteer, 'connect')
+        .resolves(pptrBrowser);
 
-    assert.strictEqual(acquiredBrowser, mockBrowser);
-    sinon.assert.calledOnce(mockBrowser.close);
-    sinon.assert.notCalled(mockBrowser.disconnect);
-    sinon.assert.calledOnce(launchStub);
-  });
+      const args = createMockParsedArguments({
+        browserUrl: 'http://127.0.0.1:9222',
+        channel: 'stable',
+      });
+      const manager = new BrowserManager(args);
 
-  it('rejects acquisition while a launched browser is shutting down', async () => {
-    const closeDeferred = createDeferred<void>();
-    const mockBrowser = createMockBrowser();
-    mockBrowser.close.returns(closeDeferred.promise);
-    const launchStub = sinon.stub(puppeteer, 'launch').resolves(mockBrowser);
+      const browser = await manager.ensureBrowser();
 
-    const options = {
-      headless: true,
-      isolated: true,
-      devtools: false,
-    };
-    await ensureBrowserLaunched(options);
-    const shutdown = closeBrowser();
-    await Promise.resolve();
+      assert.strictEqual(browser, pptrBrowser);
+      sinon.assert.calledOnce(connectStub);
+      sinon.assert.notCalled(launchStub);
+      sinon.assert.calledWithMatch(connectStub, {
+        browserURL: 'http://127.0.0.1:9222',
+      });
 
-    const secondAcquisition = ensureBrowserLaunched(options);
-    await assert.rejects(secondAcquisition, /Browser is shutting down/);
-    sinon.assert.calledOnce(launchStub);
-    sinon.assert.calledOnce(mockBrowser.close);
-
-    closeDeferred.resolve(undefined);
-    await shutdown;
-  });
-
-  it('disconnects an attached browser acquired during shutdown', async () => {
-    const deferred = createDeferred<Browser>();
-    const mockBrowser = createMockBrowser();
-    const connectStub = sinon.stub(puppeteer, 'connect');
-    connectStub.returns(deferred.promise);
-
-    const acquisition = ensureBrowserConnected({
-      browserURL: 'http://127.0.0.1:9222',
-      devtools: false,
+      await manager.close();
+      sinon.assert.calledOnceWithExactly(pptrBrowser.disconnect);
+      sinon.assert.notCalled(pptrBrowser.close);
     });
-    const shutdown = closeBrowser();
 
-    deferred.resolve(mockBrowser);
-    const [acquiredBrowser] = await Promise.all([acquisition, shutdown]);
+    it('deduplicates concurrent ensureBrowser() calls while launch is in-flight', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const {promise, resolve} = Promise.withResolvers<Browser>();
+      const launchStub = sinon.stub(puppeteer, 'launch').returns(promise);
 
-    assert.strictEqual(acquiredBrowser, mockBrowser);
-    sinon.assert.notCalled(mockBrowser.close);
-    sinon.assert.calledOnce(mockBrowser.disconnect);
-    sinon.assert.calledOnce(connectStub);
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+      });
+      const manager = new BrowserManager(args);
+
+      const call1 = manager.ensureBrowser();
+      const call2 = manager.ensureBrowser();
+
+      resolve(pptrBrowser);
+      const [browser1, browser2] = await Promise.all([call1, call2]);
+
+      assert.strictEqual(browser1, pptrBrowser);
+      assert.strictEqual(browser2, pptrBrowser);
+      sinon.assert.calledOnce(launchStub);
+    });
+
+    it('clears pending state on launch failure so subsequent ensureBrowser() retries', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const launchStub = sinon
+        .stub(puppeteer, 'launch')
+        .onFirstCall()
+        .rejects(new Error('launch failed'))
+        .onSecondCall()
+        .resolves(pptrBrowser);
+
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+      });
+      const manager = new BrowserManager(args);
+
+      await assert.rejects(manager.ensureBrowser(), /launch failed/);
+      const browser = await manager.ensureBrowser();
+
+      assert.strictEqual(browser, pptrBrowser);
+      sinon.assert.calledTwice(launchStub);
+    });
+
+    it('reconnects when existing browser is no longer connected', async () => {
+      const pptrBrowser1 = createMockPuppeteerBrowser();
+      const pptrBrowser2 = createMockPuppeteerBrowser();
+      let isConnected = true;
+      sinon.stub(pptrBrowser1, 'connected').get(() => isConnected);
+
+      const launchStub = sinon
+        .stub(puppeteer, 'launch')
+        .onFirstCall()
+        .resolves(pptrBrowser1)
+        .onSecondCall()
+        .resolves(pptrBrowser2);
+
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+      });
+      const manager = new BrowserManager(args);
+
+      const first = await manager.ensureBrowser();
+      assert.strictEqual(first, pptrBrowser1);
+
+      isConnected = false;
+      const second = await manager.ensureBrowser();
+      assert.strictEqual(second, pptrBrowser2);
+      sinon.assert.calledTwice(launchStub);
+    });
+
+    it('waits for in-flight launch, closes browser, and rejects ensureBrowser() when close() is called mid-launch', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const launchStarted = Promise.withResolvers<void>();
+      const launchDeferred = Promise.withResolvers<Browser>();
+      const closeDeferred = Promise.withResolvers<void>();
+      const launchStub = sinon.stub(puppeteer, 'launch').callsFake(() => {
+        launchStarted.resolve();
+        return launchDeferred.promise;
+      });
+      let browserClosed = false;
+      pptrBrowser.close.callsFake(async () => {
+        await closeDeferred.promise;
+        browserClosed = true;
+      });
+
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+      });
+      const manager = new BrowserManager(args);
+
+      const ensurePromise1 = manager.ensureBrowser();
+      await launchStarted.promise;
+
+      const ensurePromise2 = manager.ensureBrowser();
+      const closePromise = manager.close();
+
+      launchDeferred.resolve(pptrBrowser);
+      closeDeferred.resolve();
+
+      await Promise.all([
+        assert.rejects(ensurePromise1, err => {
+          assert.strictEqual(browserClosed, true);
+          assert.match(String(err), /Browser was closed while initializing/);
+          return true;
+        }),
+        assert.rejects(ensurePromise2, err => {
+          assert.strictEqual(browserClosed, true);
+          assert.match(String(err), /Browser was closed while initializing/);
+          return true;
+        }),
+        closePromise,
+      ]);
+
+      sinon.assert.calledOnce(launchStub);
+      sinon.assert.calledOnceWithExactly(pptrBrowser.close);
+    });
+
+    it('rejects ensureBrowser() without launching a new browser when called while close() is in flight', async () => {
+      const pptrBrowser = createMockPuppeteerBrowser();
+      const closeStarted = Promise.withResolvers<void>();
+      const closeDeferred = Promise.withResolvers<void>();
+      const launchStub = sinon.stub(puppeteer, 'launch').resolves(pptrBrowser);
+      pptrBrowser.close.callsFake(() => {
+        closeStarted.resolve();
+        return closeDeferred.promise;
+      });
+
+      const args = createMockParsedArguments({
+        headless: true,
+        isolated: true,
+      });
+      const manager = new BrowserManager(args);
+
+      const browser = await manager.ensureBrowser();
+      assert.strictEqual(browser, pptrBrowser);
+
+      const closePromise = manager.close();
+      await closeStarted.promise;
+
+      const ensurePromise = manager.ensureBrowser();
+      closeDeferred.resolve();
+
+      await Promise.all([
+        assert.rejects(ensurePromise, /Browser was closed while initializing/),
+        closePromise,
+      ]);
+
+      sinon.assert.calledOnce(launchStub);
+      sinon.assert.calledOnceWithExactly(pptrBrowser.close);
+    });
+  });
+
+  describe('rootSandboxLaunchError', () => {
+    const targetClosed = new Error(
+      'Protocol error (Target.setDiscoverTargets): Target closed',
+    );
+
+    it('explains an opaque launch failure when running as root', () => {
+      const error = BrowserManager.rootSandboxLaunchError(targetClosed, [], 0);
+      assert.ok(error);
+      assert.match(error.message, /non-root user/);
+      assert.match(error.message, /pptr\.dev\/troubleshooting/);
+      // The original failure stays visible so unrelated errors are not masked.
+      assert.match(error.message, /Target closed/);
+      assert.strictEqual(error.cause, targetClosed);
+    });
+
+    it('does not explain failures when not running as root', () => {
+      assert.strictEqual(
+        BrowserManager.rootSandboxLaunchError(targetClosed, [], 1000),
+        undefined,
+      );
+    });
+
+    it('does not explain failures on platforms without uids', () => {
+      assert.strictEqual(
+        BrowserManager.rootSandboxLaunchError(targetClosed, [], undefined),
+        undefined,
+      );
+    });
+
+    it('does not explain failures when the sandbox is already disabled', () => {
+      assert.strictEqual(
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--no-sandbox'],
+          0,
+        ),
+        undefined,
+      );
+      assert.strictEqual(
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--no-sandbox=true'],
+          0,
+        ),
+        undefined,
+      );
+    });
+
+    it('is not fooled by unrelated arguments that start the same', () => {
+      assert.ok(
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--no-sandbox-and-elevated'],
+          0,
+        ),
+      );
+      assert.ok(
+        BrowserManager.rootSandboxLaunchError(
+          targetClosed,
+          ['--disable-setuid-sandbox'],
+          0,
+        ),
+      );
+    });
   });
 
   it('cannot launch multiple times with the same profile', async () => {
@@ -254,27 +357,32 @@ describe('browser', () => {
         tmpDir,
         `temp-folder-${crypto.randomUUID()}`,
       );
-      const browser1 = await launch({
-        headless: true,
-        isolated: false,
-        userDataDir: folderPath,
-        executablePath: await executablePath(),
-        devtools: false,
-      });
+      const manager1 = new BrowserManager(
+        createMockParsedArguments({
+          headless: true,
+          isolated: false,
+          userDataDir: folderPath,
+          executablePath: await executablePath(),
+        }),
+      );
+      const browser1 = await manager1.ensureBrowser();
       try {
         try {
-          const browser2 = await launch({
-            headless: true,
-            isolated: false,
-            userDataDir: folderPath,
-            executablePath: await executablePath(),
-            devtools: false,
-          });
+          const manager2 = new BrowserManager(
+            createMockParsedArguments({
+              headless: true,
+              isolated: false,
+              userDataDir: folderPath,
+              executablePath: await executablePath(),
+            }),
+          );
+          const browser2 = await manager2.ensureBrowser();
           await safeClose(browser2);
           assert.fail('not reached');
         } catch (err) {
+          assert.ok(err instanceof Error);
           assert.strictEqual(
-            (err as Error).message,
+            err.message,
             `The browser is already running for ${folderPath}. Use --isolated to run multiple browser instances.`,
           );
         }
@@ -291,17 +399,19 @@ describe('browser', () => {
         tmpDir,
         `temp-folder-${crypto.randomUUID()}`,
       );
-      const browser = await launch({
-        headless: true,
-        isolated: false,
-        userDataDir: folderPath,
-        executablePath: await executablePath(),
-        viewport: {
-          width: 1501,
-          height: 801,
-        },
-        devtools: false,
-      });
+      const manager = new BrowserManager(
+        createMockParsedArguments({
+          headless: true,
+          isolated: false,
+          userDataDir: folderPath,
+          executablePath: await executablePath(),
+          viewport: {
+            width: 1501,
+            height: 801,
+          },
+        }),
+      );
+      const browser = await manager.ensureBrowser();
       try {
         const [page] = await browser.pages();
         const result = await page.evaluate(() => {
@@ -324,22 +434,27 @@ describe('browser', () => {
         tmpDir,
         `temp-folder-${crypto.randomUUID()}`,
       );
-      const browser = await launch({
-        headless: true,
-        isolated: false,
-        userDataDir: folderPath,
-        executablePath: await executablePath(),
-        devtools: false,
-        chromeArgs: ['--remote-debugging-port=0'],
-      });
-      try {
-        const connectedBrowser = await ensureBrowserConnected({
+      const launchManager = new BrowserManager(
+        createMockParsedArguments({
+          headless: true,
+          isolated: false,
           userDataDir: folderPath,
-          devtools: false,
-        });
+          executablePath: await executablePath(),
+          chromeArg: ['--remote-debugging-port=0'],
+        }),
+      );
+      const browser = await launchManager.ensureBrowser();
+      try {
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            userDataDir: folderPath,
+            autoConnect: true,
+          }),
+        );
+        const connectedBrowser = await manager.ensureBrowser();
         assert.ok(connectedBrowser);
         assert.ok(connectedBrowser.connected);
-        connectedBrowser.disconnect();
+        await manager.close();
       } finally {
         await safeClose(browser);
       }
@@ -360,13 +475,15 @@ describe('browser', () => {
           '<html><body>Blocked</body></html>',
         );
 
-        const browser = await launch({
-          headless: true,
-          isolated: true,
-          executablePath: await executablePath(),
-          devtools: false,
-          blocklist: ['*://*:*/blocked.html'],
-        });
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            headless: true,
+            isolated: true,
+            executablePath: await executablePath(),
+            blockedUrlPattern: ['*://*:*/blocked.html'],
+          }),
+        );
+        const browser = await manager.ensureBrowser();
         try {
           const page = await browser.newPage();
 
@@ -403,13 +520,15 @@ describe('browser', () => {
           '<html><body>Blocked</body></html>',
         );
 
-        const browser = await launch({
-          headless: true,
-          isolated: true,
-          executablePath: await executablePath(),
-          devtools: false,
-          allowlist: ['*://*:*/allowed.html'],
-        });
+        const manager = new BrowserManager(
+          createMockParsedArguments({
+            headless: true,
+            isolated: true,
+            executablePath: await executablePath(),
+            allowedUrlPattern: ['*://*:*/allowed.html'],
+          }),
+        );
+        const browser = await manager.ensureBrowser();
         try {
           const page = await browser.newPage();
 
@@ -438,8 +557,8 @@ describe('browser', () => {
 
   describe('makeTargetFilter', () => {
     it('filters internal chrome and extension targets', () => {
-      const filterWithoutExtensions = makeTargetFilter(false);
-      const filterWithExtensions = makeTargetFilter(true);
+      const filterWithoutExtensions = BrowserManager.makeTargetFilter(false);
+      const filterWithExtensions = BrowserManager.makeTargetFilter(true);
 
       const mockTarget = (url: string) => ({
         url: () => url,

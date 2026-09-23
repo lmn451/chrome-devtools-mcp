@@ -19,7 +19,7 @@ export type CommentThreadPayload = CD4ACommentThread;
 export type CommentEditorPayload = CD4AEditorAnchorSignature;
 export type RevealTargetPayload = CD4ARevealTarget;
 
-export const openDevtools = definePageTool({
+export const openDevtools = definePageTool(() => ({
   name: 'open_devtools',
   description: 'Open a DevTools window for the selected page.',
   annotations: {
@@ -41,9 +41,9 @@ export const openDevtools = definePageTool({
     }
     response.setIncludePages(true);
   },
-});
+}));
 
-export const getDevtoolsComments = definePageTool({
+export const getDevtoolsComments = definePageTool(() => ({
   name: 'get_devtools_comments',
   description: 'Retrieve user comments from the DevTools window for the page.',
   annotations: {
@@ -64,15 +64,14 @@ export const getDevtoolsComments = definePageTool({
       return;
     }
 
-    const threads = await devtoolsPage.evaluate(() => {
-      return window.universe?.cd4aBridge?.getCommentThreads() ?? [];
-    });
+    const bridge = await page.ensureDevToolsCommentBridge(devtoolsPage);
+    const threads = await bridge.getComments(devtoolsPage);
 
     response.setDevToolsComments(threads);
   },
-});
+}));
 
-export const resolveDevtoolsComment = definePageTool({
+export const resolveDevtoolsComment = definePageTool(() => ({
   name: 'resolve_devtools_comment',
   description:
     'Append an agent reply to a DevTools comment thread and mark it as resolved.',
@@ -130,9 +129,9 @@ export const resolveDevtoolsComment = definePageTool({
       );
     }
   },
-});
+}));
 
-export const revealInDevtools = definePageTool({
+export const revealInDevtools = definePageTool(() => ({
   name: 'reveal_in_devtools',
   description:
     'Navigate DevTools to a specified panel and highlight a target DOM node or network request. The parameters uid and reqid are mutually exclusive.',
@@ -222,4 +221,4 @@ export const revealInDevtools = definePageTool({
       response.appendResponseLine(`Revealed target${targetDesc} in DevTools.`);
     }
   },
-});
+}));

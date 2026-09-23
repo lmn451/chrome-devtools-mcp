@@ -457,5 +457,13 @@
   {
     "name": "devtools_comments",
     "flagType": "boolean"
+  },
+  {
+    "name": "http_port_present",
+    "flagType": "boolean"
+  },
+  {
+    "name": "server_url_present",
+    "flagType": "boolean"
   }
 ]

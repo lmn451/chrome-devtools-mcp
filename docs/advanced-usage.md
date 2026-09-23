@@ -2,6 +2,12 @@
 
 ## Shared server for multiple MCP clients
 
+Most MCP clients start one Chrome DevTools MCP server per conversation. If your
+client shares a single server instance across concurrent sessions, page ID
+routing is enabled by default. This exposes `pageId` on page-scoped tools so
+each session can route tool calls to the tab it is working with. Use
+`--no-page-id-routing` to restore selected-page-only routing.
+
 A single long-lived `chrome-devtools-mcp` process can serve multiple clients
 over Streamable HTTP. Start it with `--http-port=<port>`; the service listens
 at `http://127.0.0.1:<port>/mcp`. The process owns one browser connection. It

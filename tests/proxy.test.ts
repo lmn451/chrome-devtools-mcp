@@ -13,14 +13,14 @@ import {
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {describe, it} from 'node:test';
 
-import {Client} from '@modelcontextprotocol/sdk/client/index.js';
-import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
+  Client,
   isJSONRPCNotification,
   isJSONRPCRequest,
   JSONRPCMessageSchema,
+  StdioClientTransport,
   type JSONRPCMessage,
-} from '@modelcontextprotocol/sdk/types.js';
+} from '../src/third_party/index.js';
 
 const SESSION_ID = 'proxy-test-session';
 const PROTOCOL_VERSION = '2025-06-18';
@@ -373,12 +373,10 @@ describe('stdio proxy', () => {
       const calls = await Promise.all([
         client.callTool(
           {name: 'echo', arguments: {value: 'first'}},
-          undefined,
           {timeout: 2_000},
         ),
         client.callTool(
           {name: 'echo', arguments: {value: 'second'}},
-          undefined,
           {timeout: 2_000},
         ),
       ]);

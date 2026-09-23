@@ -8,8 +8,7 @@ import type fs from 'node:fs';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 
-import type {Channel} from './browser.js';
-import {ensureBrowserConnected, ensureBrowserLaunched} from './browser.js';
+import {BrowserManager} from './BrowserManager.js';
 import {type ParsedArguments} from './config/mcp-options.js';
 import {loadIssueDescriptions} from './devtools/issueDescriptions.js';
 import {McpContext} from './McpContext.js';
@@ -17,12 +16,8 @@ import {ClearcutLogger} from './telemetry/ClearcutLogger.js';
 import {FilePersistence} from './telemetry/persistence.js';
 import {
   McpServer as SdkMcpServer,
-  type CallToolResult,
   type Root,
   type Transport,
-  SetLevelRequestSchema,
-  ListRootsResultSchema,
-  RootsListChangedNotificationSchema,
   Mutex,
   puppeteer,
 } from './third_party/index.js';
@@ -45,6 +40,8 @@ puppeteer.setFollowSymlinks(false);
 const ROOTS_REQUEST_TIMEOUT = 5_000;
 
 export interface McpServerOptions {
+  browserManager: BrowserManager;
+  closeBrowserManager?: boolean;
   logFile?: fs.WriteStream;
   getSessionId?: () => string | undefined;
 }
@@ -52,7 +49,9 @@ export interface McpServerOptions {
 export class McpServer {
   readonly server: SdkMcpServer;
   #serverArgs: ParsedArguments;
+  #browserManager: BrowserManager;
   #options: McpServerOptions;
+  #closeBrowserManager: boolean;
   #context?: McpContext;
 
   /**
@@ -64,13 +63,11 @@ export class McpServer {
   #toolMutex = new Mutex();
   #closePromise?: Promise<void>;
 
-  private constructor(
-    serverArgs: ParsedArguments,
-    options: McpServerOptions = {},
-  ) {
+  private constructor(serverArgs: ParsedArguments, options: McpServerOptions) {
     this.#serverArgs = serverArgs;
+    this.#browserManager = options.browserManager;
     this.#options = options;
-
+    this.#closeBrowserManager = options.closeBrowserManager ?? true;
     if (this.#serverArgs.usageStatistics && !ClearcutLogger.get()) {
       ClearcutLogger.initialize({
         persistence: new FilePersistence(),
@@ -92,7 +89,7 @@ export class McpServer {
       {capabilities: {logging: {}}},
     );
 
-    this.server.server.setRequestHandler(SetLevelRequestSchema, () => {
+    this.server.server.setRequestHandler('logging/setLevel', () => {
       return {};
     });
 
@@ -104,7 +101,7 @@ export class McpServer {
       if (this.server.server.getClientCapabilities()?.roots) {
         void this.#updateRoots();
         this.server.server.setNotificationHandler(
-          RootsListChangedNotificationSchema,
+          'notifications/roots/list_changed',
           () => {
             void this.#updateRoots();
           },
@@ -134,49 +131,52 @@ export class McpServer {
     if (this.#closePromise !== undefined) {
       return await this.#closePromise;
     }
-
     const context = this.#context;
     this.#context = undefined;
-    const closePromise = (async (): Promise<void> => {
-      let serverCloseError: unknown;
-      let serverCloseFailed = false;
-      try {
-        await this.server.close();
-      } catch (error) {
-        serverCloseFailed = true;
-        serverCloseError = error;
-      }
+    const closePromise = Promise.resolve().then(async () => {
+      await this.#closeResources(context);
+    });
+    this.#closePromise = closePromise;
+    return await closePromise;
+  }
 
+  async #closeResources(context: McpContext | undefined): Promise<void> {
+    const errors: unknown[] = [];
+    try {
+      await this.server.close();
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
       const guard = await this.#toolMutex.acquire();
       try {
         // Acquiring and releasing the mutex drains any tool already in flight.
       } finally {
         guard[Symbol.dispose]();
       }
-
-      let contextDisposeError: unknown;
-      let contextDisposeFailed = false;
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await context?.dispose();
+    } catch (error) {
+      errors.push(error);
+    }
+    if (this.#closeBrowserManager) {
       try {
-        await context?.dispose();
+        await this.#browserManager.close();
       } catch (error) {
-        contextDisposeFailed = true;
-        contextDisposeError = error;
+        errors.push(error);
       }
-
-      if (serverCloseFailed) {
-        throw serverCloseError;
-      }
-      if (contextDisposeFailed) {
-        throw contextDisposeError;
-      }
-    })();
-    this.#closePromise = closePromise;
-    return await closePromise;
+    }
+    if (errors.length > 0) {
+      throw new AggregateError(errors, 'Failed to close MCP server cleanly');
+    }
   }
 
   [Symbol.dispose](): void {
-    this.close().catch(() => {
-      // TODO: wire up the logger
+    this.close().catch(err => {
+      logger?.('Failed to dispose McpServer', err);
     });
   }
 
@@ -186,7 +186,7 @@ export class McpServer {
 
   static async from(
     serverArgs: ParsedArguments,
-    options: McpServerOptions = {},
+    options: McpServerOptions,
   ): Promise<McpServer> {
     const server = new McpServer(serverArgs, options);
     await server.#init();
@@ -207,7 +207,7 @@ export class McpServer {
         ? []
         : (this.#serverArgs.filesystemRoot ?? [])
     ).map(root => {
-      const rootPath = path.resolve(String(root));
+      const rootPath = path.resolve(root);
       return {
         uri: pathToFileURL(rootPath).href,
         name: path.basename(rootPath) || rootPath,
@@ -229,12 +229,11 @@ export class McpServer {
       return;
     }
     try {
-      const roots = await this.server.server.request(
+      const result = await this.server.server.request(
         {method: 'roots/list'},
-        ListRootsResultSchema,
         timeout === undefined ? undefined : {timeout},
       );
-      this.#lastClientRoots = roots.roots;
+      this.#lastClientRoots = result.roots;
       this.#context?.setRoots(this.#combinedRoots());
     } catch (e) {
       logger?.('Failed to list roots', e);
@@ -242,68 +241,21 @@ export class McpServer {
   }
 
   async #getContext(): Promise<McpContext> {
-    const chromeArgs: string[] = (this.#serverArgs.chromeArg ?? []).map(String);
-    const ignoreDefaultChromeArgs: string[] = (
-      this.#serverArgs.ignoreDefaultChromeArg ?? []
-    ).map(String);
-    if (this.#serverArgs.proxyServer) {
-      chromeArgs.push(`--proxy-server=${this.#serverArgs.proxyServer}`);
-    }
-    const devtools = this.#serverArgs.experimentalDevtools ?? false;
-    const blocklist = this.#serverArgs.blockedUrlPattern
-      ? this.#serverArgs.blockedUrlPattern.map(String)
-      : undefined;
-    const allowlist = this.#serverArgs.allowedUrlPattern
-      ? this.#serverArgs.allowedUrlPattern.map(String)
-      : undefined;
-
-    const channel = this.#serverArgs.channel as Channel | undefined;
-
-    const browser =
-      this.#serverArgs.browserUrl ||
-      this.#serverArgs.wsEndpoint ||
-      this.#serverArgs.autoConnect
-        ? await ensureBrowserConnected({
-            browserURL: this.#serverArgs.browserUrl,
-            wsEndpoint: this.#serverArgs.wsEndpoint,
-            wsHeaders: this.#serverArgs.wsHeaders,
-            // Important: only pass channel, if autoConnect is true.
-            channel: this.#serverArgs.autoConnect ? channel : undefined,
-            userDataDir: this.#serverArgs.userDataDir,
-            devtools,
-            blocklist,
-            allowlist,
-          })
-        : await ensureBrowserLaunched({
-            headless: this.#serverArgs.headless,
-            executablePath: this.#serverArgs.executablePath,
-            channel,
-            isolated: this.#serverArgs.isolated ?? false,
-            userDataDir: this.#serverArgs.userDataDir,
-            logFile: this.#options.logFile,
-            viewport: this.#serverArgs.viewport,
-            chromeArgs,
-            ignoreDefaultChromeArgs,
-            acceptInsecureCerts: this.#serverArgs.acceptInsecureCerts,
-            devtools,
-            enableExtensions: this.#serverArgs.categoryExtensions,
-            viaCli: this.#serverArgs.viaCli,
-            blocklist,
-            allowlist,
-          });
+    const browser = await this.#browserManager.ensureBrowser();
 
     if (this.#context?.browser !== browser) {
       const previousContext = this.#context;
       this.#context = undefined;
       await previousContext?.dispose();
       this.#context = await McpContext.from(browser, logger, {
-        experimentalDevToolsDebugging: devtools,
+        experimentalDevToolsDebugging:
+          this.#serverArgs.experimentalDevtools ?? false,
         experimentalIncludeAllPages:
           this.#serverArgs.experimentalIncludeAllPages,
         performanceCrux: this.#serverArgs.performanceCrux,
         sourceMaps: this.#serverArgs.sourceMaps,
-        allowList: allowlist,
-        blocklist: blocklist,
+        allowlist: this.#serverArgs.allowedUrlPattern,
+        blocklist: this.#serverArgs.blockedUrlPattern,
         allowUnrestrictedPaths: this.#serverArgs.allowUnrestrictedPaths,
         // Surfaces a one-time note in the next response after a reconnect.
         reconnected: previousContext !== undefined,
@@ -345,21 +297,19 @@ export class McpServer {
       () => this.server.server.getClientVersion()?.name,
     );
 
-    if (!toolHandler.shouldRegister) {
-      return;
-    }
-
-    this.server.registerTool(
+    const registeredTool = this.server.registerTool(
       tool.name,
       {
         description: tool.description,
         inputSchema: toolHandler.registeredInputSchema,
         annotations: tool.annotations,
       },
-      async (params): Promise<CallToolResult> => {
-        return await toolHandler.handle(params);
-      },
+      toolHandler.handle,
     );
+
+    if (toolHandler.disabled) {
+      registeredTool.disable();
+    }
   }
 }
 
@@ -372,9 +322,17 @@ export class McpServer {
  */
 export async function createMcpServer(
   serverArgs: ParsedArguments,
-  options: McpServerOptions = {},
+  options: {
+    logFile?: fs.WriteStream;
+  },
 ): Promise<{server: SdkMcpServer}> {
-  const server = await McpServer.from(serverArgs, options);
+  const browserManager = new BrowserManager(serverArgs, {
+    logFile: options.logFile,
+  });
+  const server = await McpServer.from(serverArgs, {
+    browserManager,
+    ...options,
+  });
   return {server: server.server};
 }
 
