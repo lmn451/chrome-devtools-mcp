@@ -7,16 +7,18 @@
 import {randomUUID} from 'node:crypto';
 import type fs from 'node:fs';
 import {isIP} from 'node:net';
+import {Readable} from 'node:stream';
 import http, {
   type IncomingMessage,
   type Server,
   type ServerResponse,
 } from 'node:http';
 
+import {BrowserManager} from './BrowserManager.js';
 import {McpServer} from './index.js';
 import {
   isInitializeRequest,
-  StreamableHTTPServerTransport,
+  WebStandardStreamableHTTPServerTransport,
 } from './third_party/index.js';
 import type {ParsedArguments} from './config/mcp-options.js';
 import {logger} from './utils/logger.js';
@@ -53,7 +55,7 @@ export interface McpHttpServer {
 
 interface HttpSession {
   server: McpServer;
-  transport: StreamableHTTPServerTransport;
+  transport: WebStandardStreamableHTTPServerTransport;
   sessionId?: string;
   idleTimer?: TimeoutHandle;
   activeRequests: number;
@@ -70,6 +72,126 @@ class HttpRequestError extends Error {
 }
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'content-length',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+async function* readWebBody(
+  body: ReadableStream<Uint8Array<ArrayBuffer>>,
+): AsyncGenerator<Uint8Array<ArrayBuffer>> {
+  const reader = body.getReader();
+  let complete = false;
+  try {
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) {
+        complete = true;
+        return;
+      }
+      yield value;
+    }
+  } finally {
+    if (!complete) {
+      await reader.cancel().catch(error => {
+        logger?.('Failed to cancel HTTP MCP response stream', error);
+      });
+    }
+    reader.releaseLock();
+  }
+}
+
+async function writeWebResponse(
+  webResponse: Response,
+  response: ServerResponse,
+): Promise<void> {
+  webResponse.headers.forEach((value, name) => {
+    response.setHeader(name, value);
+  });
+  response.writeHead(webResponse.status);
+  if (webResponse.body === null) {
+    response.end();
+    return;
+  }
+  const readable = Readable.from(readWebBody(webResponse.body));
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = (): void => {
+      readable.off('error', onError);
+      response.off('error', onError);
+      response.off('finish', onFinish);
+      response.off('close', onClose);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onFinish = (): void => {
+      cleanup();
+      resolve();
+    };
+    const onClose = (): void => {
+      cleanup();
+      readable.destroy();
+      resolve();
+    };
+    readable.once('error', onError);
+    response.once('error', onError);
+    response.once('finish', onFinish);
+    response.once('close', onClose);
+    readable.pipe(response);
+  });
+}
+
+async function handleTransportRequest(
+  transport: WebStandardStreamableHTTPServerTransport,
+  request: IncomingMessage,
+  response: ServerResponse,
+  parsedBody?: unknown,
+): Promise<void> {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (value === undefined || HOP_BY_HOP_HEADERS.has(name)) {
+      continue;
+    }
+    headers.set(name, Array.isArray(value) ? value.join(', ') : value);
+  }
+  const method = request.method ?? 'GET';
+  const body = method === 'POST' ? JSON.stringify(parsedBody) : undefined;
+  if (method === 'POST' && body === undefined) {
+    throw new HttpRequestError(400, 'Request body must be valid JSON.');
+  }
+  const abortController = new AbortController();
+  const onAborted = (): void => {
+    abortController.abort();
+  };
+  const onResponseClose = (): void => {
+    if (!response.writableEnded) {
+      abortController.abort();
+    }
+  };
+  request.once('aborted', onAborted);
+  response.once('close', onResponseClose);
+  try {
+    const webRequest = new Request(
+      new URL(request.url ?? MCP_PATH, 'http://127.0.0.1'),
+      {method, headers, body, signal: abortController.signal},
+    );
+    const webResponse = await transport.handleRequest(webRequest);
+    await writeWebResponse(webResponse, response);
+  } finally {
+    request.off('aborted', onAborted);
+    response.off('close', onResponseClose);
+  }
 }
 
 function sendJsonRpcError(
@@ -367,6 +489,9 @@ export async function startMcpHttpServer(
     'sessionIdleTimeoutMs',
   );
 
+  const browserManager = new BrowserManager(serverArgs, {
+    logFile: options.logFile,
+  });
   const sessions = new Map<string, HttpSession>();
   const pendingSessions = new Set<HttpSession>();
   const pendingInitializationPromises = new Set<Promise<HttpSession>>();
@@ -435,7 +560,7 @@ export async function startMcpHttpServer(
   };
 
   const createSession = async (): Promise<HttpSession> => {
-    const transport = new StreamableHTTPServerTransport({
+    const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: randomUUID,
       onsessioninitialized: sessionId => {
         if (session === undefined || session.closePromise !== undefined) {
@@ -454,6 +579,8 @@ export async function startMcpHttpServer(
       },
     });
     const server = await McpServer.from(serverArgs, {
+      browserManager,
+      closeBrowserManager: false,
       logFile: options.logFile,
       getSessionId: () => transport.sessionId,
     });
@@ -628,13 +755,14 @@ export async function startMcpHttpServer(
     }
 
     try {
-      if (method === 'POST') {
-        await session.transport.handleRequest(request, response, parsedBody);
-        if (session.sessionId === undefined) {
-          await closeSession(session);
-        }
-      } else {
-        await session.transport.handleRequest(request, response);
+      await handleTransportRequest(
+        session.transport,
+        request,
+        response,
+        parsedBody,
+      );
+      if (method === 'POST' && session.sessionId === undefined) {
+        await closeSession(session);
       }
     } catch (error) {
       await closeSession(session).catch(closeError => {
@@ -683,6 +811,9 @@ export async function startMcpHttpServer(
     await promise;
   } catch (error) {
     nodeServer.closeAllConnections();
+    await browserManager.close().catch(closeError => {
+      logger?.('Failed to close browser manager after bind error', closeError);
+    });
     throw error;
   }
 
@@ -690,6 +821,9 @@ export async function startMcpHttpServer(
   if (address === null || typeof address === 'string') {
     await closeNodeServer(nodeServer).catch(closeError => {
       logger?.('Failed to close HTTP server after bind error', closeError);
+    });
+    await browserManager.close().catch(closeError => {
+      logger?.('Failed to close browser manager after bind error', closeError);
     });
     throw new Error('HTTP server did not provide a bound address');
   }
@@ -713,7 +847,20 @@ export async function startMcpHttpServer(
           await closeSession(session);
         }),
       );
-      await closeNodeServer(nodeServer);
+      const errors: unknown[] = [];
+      try {
+        await closeNodeServer(nodeServer);
+      } catch (error) {
+        errors.push(error);
+      }
+      try {
+        await browserManager.close();
+      } catch (error) {
+        errors.push(error);
+      }
+      if (errors.length > 0) {
+        throw new AggregateError(errors, 'Failed to close HTTP server cleanly');
+      }
     })();
 
     return await closePromise;

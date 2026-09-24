@@ -55,7 +55,7 @@ export const mcpOptions = {
   logFile: {
     type: 'string',
     describe:
-      'Path to a file to write debug logs to. Set the env variable `DEBUG` to `*` to enable verbose logs. Useful for submitting bug reports.',
+      'Path to a file to write debug logs to. Set the env variable `NODE_DEBUG` to `*` to enable verbose logs. Useful for submitting bug reports.',
   },
   httpPort: {
     type: 'number',
@@ -176,12 +176,14 @@ export const mcpOptions = {
   },
   blockedUrlPattern: {
     type: 'array',
+    string: true,
     describe:
       "Restricts browser's network access by blocking specified URL patterns (uses https://urlpattern.spec.whatwg.org/). Silently detaches from targets with blocked URLs upon connection, and blocks runtime requests (including navigations and subresources). Accepts an array of patterns.",
     conflicts: ['allowedUrlPattern'],
   },
   allowedUrlPattern: {
     type: 'array',
+    string: true,
     describe:
       "Restricts browser's network access by allowing only specified URL patterns (uses https://urlpattern.spec.whatwg.org/). Requires Chrome 149+. Silently detaches from targets with unallowed URLs upon connection, and blocks runtime requests (including navigations and subresources). Accepts an array of patterns.",
     conflicts: ['blockedUrlPattern'],
@@ -308,6 +310,7 @@ export const mcpOptions = {
   },
   filesystemRoot: {
     type: 'array',
+    string: true,
     alias: 'workspace',
     default: DEFAULT_FILESYSTEM_ROOT,
     defaultDescription: 'OS temp directory',
@@ -511,7 +514,7 @@ export function parser(
           throw new Error('Config must be a JSON object');
         }
 
-        return yargs()
+        yargs()
           .parserConfiguration({
             'strip-aliased': true,
             'camel-case-expansion': false,
@@ -522,6 +525,7 @@ export function parser(
           .fail(false)
           .exitProcess(false)
           .parseSync([]);
+        return parsed;
       } catch (err) {
         throw new Error(`Invalid JSON config file: ${(err as Error).message}`);
       }

@@ -1,0 +1,37 @@
+name: Sync upstream main
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # 09:00 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: ${{ github.repository == 'lmn451/chrome-devtools-mcp' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream main into fork main
+        run: |
+          git remote add upstream https://github.com/ChromeDevTools/chrome-devtools-mcp.git
+          git fetch --no-tags upstream main
+          # Merge to preserve fork-only commits, including PR #3.
+          git merge --no-edit FETCH_HEAD
+          git push origin HEAD:refs/heads/main

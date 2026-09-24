@@ -12,19 +12,18 @@ import path from 'node:path';
 import {describe, it} from 'node:test';
 import {pathToFileURL} from 'node:url';
 
-import {Client} from '@modelcontextprotocol/sdk/client/index.js';
-import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js';
-import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
-  ListRootsRequestSchema,
+  Client,
+  StdioClientTransport,
+  StreamableHTTPClientTransport,
   type Root,
-} from '@modelcontextprotocol/sdk/types.js';
+} from '../src/third_party/index.js';
 import {executablePath} from 'puppeteer';
 
-import {closeBrowser} from '../src/browser.js';
 import {parseArguments} from '../src/config/mcp-options.js';
 import {startMcpHttpServer} from '../src/http-server.js';
 import {VERSION} from '../src/version.js';
+import {createTempDir} from './utils.js';
 
 interface HttpClient {
   client: Client;
@@ -164,7 +163,7 @@ async function connectClient(
       },
     },
   );
-  client.setRequestHandler(ListRootsRequestSchema, () => {
+  client.setRequestHandler('roots/list', () => {
     return {roots};
   });
   try {
@@ -203,7 +202,7 @@ async function connectProxyClient(url: URL): Promise<ProxyClient> {
       },
     },
   );
-  client.setRequestHandler(ListRootsRequestSchema, () => {
+  client.setRequestHandler('roots/list', () => {
     return {roots: []};
   });
   try {
@@ -250,9 +249,11 @@ async function closeProxyClient(
 
 describe('shared-browser HTTP MCP service', () => {
   it('keeps pages, selection, and roots independent across sessions', async () => {
-    const rootPath = await fs.mkdtemp(
-      path.join(os.homedir(), '.chrome-devtools-mcp-http-root-'),
+    using rootDir = createTempDir(
+      '.chrome-devtools-mcp-http-root-',
+      os.homedir(),
     );
+    const rootPath = rootDir.path;
     let service: HttpService | undefined;
     let clientA: HttpClient | undefined;
     let clientB: HttpClient | undefined;
@@ -410,8 +411,6 @@ describe('shared-browser HTTP MCP service', () => {
       if (service !== undefined) {
         await service.close();
       }
-      await closeBrowser();
-      await fs.rm(rootPath, {recursive: true, force: true});
       await fs.rm(screenshotBAfterClose, {force: true});
     }
   });

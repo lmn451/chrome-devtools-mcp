@@ -8,7 +8,7 @@ import '../utils/polyfill.js';
 
 import process from 'node:process';
 
-import {closeBrowser} from '../browser.js';
+import {BrowserManager} from '../BrowserManager.js';
 import {startMcpHttpServer, type McpHttpServer} from '../http-server.js';
 import {McpServer, logDisclaimers} from '../index.js';
 import {runStdioProxy} from '../proxy.js';
@@ -38,6 +38,7 @@ if (process.env['CHROME_DEVTOOLS_MCP_CRASH_ON_UNCAUGHT'] !== 'true') {
   });
 }
 
+logger?.(`Starting Chrome DevTools MCP Server v${VERSION}`);
 let shuttingDown = false;
 let httpServer: McpHttpServer | undefined;
 let stdioServer: McpServer | undefined;
@@ -61,7 +62,6 @@ async function shutdown(reason: string): Promise<void> {
     logger?.('Shutdown timeout exceeded, forcing exit');
     process.exit(0);
   }, 5000).unref();
-
   if (httpServer !== undefined) {
     await httpServer.close().catch(error => {
       logger?.('Failed to close HTTP server', error);
@@ -80,7 +80,6 @@ async function shutdown(reason: string): Promise<void> {
       logger?.('Failed to close stdio proxy', error);
     });
   }
-  await closeBrowser();
   process.exit(0);
 }
 
@@ -102,8 +101,6 @@ process.on('SIGHUP', () => {
   void shutdown('SIGHUP');
 });
 
-logger?.(`Starting Chrome DevTools MCP Server v${VERSION}`);
-
 if (isProxyMode) {
   proxyPromise = runStdioProxy(serverUrl);
   await proxyPromise;
@@ -117,6 +114,7 @@ if (isProxyMode) {
   logDisclaimers(args);
 } else {
   stdioServer = await McpServer.from(args, {
+    browserManager: new BrowserManager(args, {logFile}),
     logFile,
   });
   const transport = new StdioServerTransport();
