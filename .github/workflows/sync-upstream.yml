@@ -58,67 +58,25 @@ jobs:
     if: ${{ needs.sync.outputs.conflict_files != '' }}
     runs-on: ubuntu-latest
     permissions:
-      issues: write
+      contents: read
     steps:
-      - name: Create or update conflict issue
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+      - name: Publish conflict report
         env:
           CONFLICT_FILES_JSON: ${{ needs.sync.outputs.conflict_files }}
-        with:
-          script: |
-            const { owner, repo } = context.repo;
-            const conflictFiles = JSON.parse(process.env.CONFLICT_FILES_JSON);
-            const title = 'Upstream sync conflict on main';
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-            const escapeHtml = (value) => value
-              .replaceAll('&', '&amp;')
-              .replaceAll('<', '&lt;')
-              .replaceAll('>', '&gt;');
-            const fileList = conflictFiles
-              .map((file) => `- <code>${escapeHtml(file)}</code>`)
-              .join('\n');
-            const startMarker = '<!-- upstream-sync-conflict:start -->';
-            const endMarker = '<!-- upstream-sync-conflict:end -->';
-            const report = [
-              startMarker,
-              'The sync could not merge upstream `main` into fork `main`.',
-              '',
-              'Conflicting path(s):',
-              fileList,
-              '',
-              `Run: ${runUrl}`,
-              'The workflow did not push the conflicted merge. Resolve the conflict, then rerun the sync.',
-              endMarker,
-            ].join('\n');
-            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
-              owner,
-              repo,
-              state: 'open',
-              per_page: 100,
-            });
-            let issue = openIssues.find((candidate) =>
-              !candidate.pull_request && candidate.title === title
-            );
-            if (issue) {
-              const existingBody = issue.body ?? '';
-              const startIndex = existingBody.indexOf(startMarker);
-              const endIndex = existingBody.indexOf(endMarker, startIndex + startMarker.length);
-              const body = startIndex >= 0 && endIndex >= 0
-                ? `${existingBody.slice(0, startIndex)}${report}${existingBody.slice(endIndex + endMarker.length)}`
-                : `${existingBody.trim()}\n\n${report}`.trim();
-              await github.rest.issues.update({
-                owner,
-                repo,
-                issue_number: issue.number,
-                body,
-              });
-            } else {
-              const created = await github.rest.issues.create({
-                owner,
-                repo,
-                title,
-                body: report,
-              });
-              issue = created.data;
-            }
-            core.setFailed(`Upstream sync is blocked by a merge conflict; issue #${issue.number} needs review.`);
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          {
+            echo '## Upstream sync conflict — manual review required'
+            echo
+            echo 'The sync did not push changes. Resolve the conflict, then rerun the sync.'
+            echo
+            echo 'Conflicting paths:'
+            echo
+            echo '```json'
+            printf '%s\n' "$CONFLICT_FILES_JSON"
+            echo '```'
+            echo
+            echo "[View workflow run]($RUN_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error title=Upstream sync conflict::Manual resolution required; see the job summary."
+          exit 1
