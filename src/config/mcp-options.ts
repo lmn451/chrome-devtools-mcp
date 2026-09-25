@@ -8,6 +8,7 @@ import type {YargsOptions} from '../third_party/index.js';
 import {yargs, hideBin} from '../third_party/index.js';
 import os from 'node:os';
 import {readFileSync} from 'node:fs';
+import path from 'node:path';
 
 export const DEFAULT_FILESYSTEM_ROOT = [os.tmpdir()];
 
@@ -320,6 +321,12 @@ export const mcpOptions = {
   config: {
     type: 'string',
     describe: 'Path to JSON configuration file.',
+    coerce: (configPath: string | undefined) => {
+      if (!configPath) {
+        return;
+      }
+      return path.resolve(configPath);
+    },
   },
 } satisfies Record<string, YargsOptions>;
 
@@ -364,6 +371,36 @@ export function getMcpOptionsForViaCli(): typeof mcpOptions {
   };
 }
 
+export function getCliOptions(): Partial<
+  Record<keyof typeof mcpOptions, YargsOptions>
+> {
+  const options: Partial<Record<keyof typeof mcpOptions, YargsOptions>> = {
+    ...getMcpOptionsForViaCli(),
+  };
+
+  // Missing CLI serialization.
+  delete options.viewport;
+
+  // Change the defaults for the CLI.
+  delete options.experimentalStructuredContent;
+  delete options.experimentalInteropTools;
+
+  const recordOptions: Record<string, YargsOptions | undefined> = options;
+  for (const [key, option] of Object.entries(recordOptions)) {
+    if (option?.default !== undefined) {
+      const copy: YargsOptions = {
+        ...option,
+        defaultDescription:
+          option.defaultDescription ?? JSON.stringify(option.default),
+      };
+      delete copy.default;
+      recordOptions[key] = copy;
+    }
+  }
+
+  return options;
+}
+
 /**
  * Exported only for testing to not trigger process exit.
  */
@@ -392,13 +429,25 @@ export function parser(
           args.serverUrl = serverUrl;
         }
       }
-      if (isViaCli && args.filesystemRoot === DEFAULT_FILESYSTEM_ROOT) {
-        const cliFilesystemArgs: {
-          allowUnrestrictedPaths?: boolean;
-          filesystemRoot?: unknown;
-        } = args;
-        cliFilesystemArgs.allowUnrestrictedPaths = true;
-        cliFilesystemArgs.filesystemRoot = undefined;
+      if (isViaCli) {
+        if (args.filesystemRoot === DEFAULT_FILESYSTEM_ROOT) {
+          const cliFilesystemArgs: {
+            allowUnrestrictedPaths?: boolean;
+            filesystemRoot?: unknown;
+          } = args;
+          cliFilesystemArgs.allowUnrestrictedPaths = true;
+          cliFilesystemArgs.filesystemRoot = undefined;
+        }
+        // Defaults that cannot be set in options without affecting yargs conflict resolution.
+        if (
+          args.isolated === undefined &&
+          args.userDataDir === undefined &&
+          !args.autoConnect &&
+          !args.browserUrl &&
+          !args.wsEndpoint
+        ) {
+          args.isolated = true;
+        }
       }
       // We can't set default in the options else
       // Yargs will complain
