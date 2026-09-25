@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: sync-upstream-main
@@ -17,6 +17,10 @@ jobs:
   sync:
     if: ${{ github.repository == 'lmn451/chrome-devtools-mcp' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      conflict_files: ${{ steps.merge.outputs.conflict_files }}
     steps:
       - name: Check out fork main
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -30,9 +34,91 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Merge upstream main into fork main
+        id: merge
         run: |
           git remote add upstream https://github.com/ChromeDevTools/chrome-devtools-mcp.git
           git fetch --no-tags upstream main
           # Merge to preserve fork-only commits, including PR #3.
-          git merge --no-edit FETCH_HEAD
+          if ! git merge --no-edit FETCH_HEAD; then
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            if [[ -z "$conflicts" ]]; then
+              echo "Merge failed without conflicted paths." >&2
+              exit 1
+            fi
+            conflicts_json="$(printf '%s\n' "$conflicts" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+            echo "conflict_files=$conflicts_json" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Upstream sync conflict::Manual review required"
+            exit 0
+          fi
           git push origin HEAD:refs/heads/main
+
+  report-conflict:
+    name: Report upstream merge conflict
+    needs: sync
+    if: ${{ needs.sync.outputs.conflict_files != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create or update conflict issue
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          CONFLICT_FILES_JSON: ${{ needs.sync.outputs.conflict_files }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const conflictFiles = JSON.parse(process.env.CONFLICT_FILES_JSON);
+            const title = 'Upstream sync conflict on main';
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const escapeHtml = (value) => value
+              .replaceAll('&', '&amp;')
+              .replaceAll('<', '&lt;')
+              .replaceAll('>', '&gt;');
+            const fileList = conflictFiles
+              .map((file) => `- <code>${escapeHtml(file)}</code>`)
+              .join('\n');
+            const startMarker = '<!-- upstream-sync-conflict:start -->';
+            const endMarker = '<!-- upstream-sync-conflict:end -->';
+            const report = [
+              startMarker,
+              'The sync could not merge upstream `main` into fork `main`.',
+              '',
+              'Conflicting path(s):',
+              fileList,
+              '',
+              `Run: ${runUrl}`,
+              'The workflow did not push the conflicted merge. Resolve the conflict, then rerun the sync.',
+              endMarker,
+            ].join('\n');
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            let issue = openIssues.find((candidate) =>
+              !candidate.pull_request && candidate.title === title
+            );
+            if (issue) {
+              const existingBody = issue.body ?? '';
+              const startIndex = existingBody.indexOf(startMarker);
+              const endIndex = existingBody.indexOf(endMarker, startIndex + startMarker.length);
+              const body = startIndex >= 0 && endIndex >= 0
+                ? `${existingBody.slice(0, startIndex)}${report}${existingBody.slice(endIndex + endMarker.length)}`
+                : `${existingBody.trim()}\n\n${report}`.trim();
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issue.number,
+                body,
+              });
+            } else {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body: report,
+              });
+              issue = created.data;
+            }
+            core.setFailed(`Upstream sync is blocked by a merge conflict; issue #${issue.number} needs review.`);
