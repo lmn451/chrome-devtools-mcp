@@ -9,6 +9,7 @@ import {yargs, hideBin} from '../third_party/index.js';
 import os from 'node:os';
 import {readFileSync} from 'node:fs';
 import path from 'node:path';
+import {findUnenforceablePattern} from '../utils/url.js';
 
 export const DEFAULT_FILESYSTEM_ROOT = [os.tmpdir()];
 
@@ -179,15 +180,39 @@ export const mcpOptions = {
     type: 'array',
     string: true,
     describe:
-      "Restricts browser's network access by blocking specified URL patterns (uses https://urlpattern.spec.whatwg.org/). Silently detaches from targets with blocked URLs upon connection, and blocks runtime requests (including navigations and subresources). Accepts an array of patterns.",
+      "Restricts browser's network access by blocking specified URL patterns (uses https://urlpattern.spec.whatwg.org/). Silently detaches from targets with blocked URLs upon connection, and blocks runtime requests (including navigations and subresources). Accepts an array of patterns. A pattern that uses a regexp group in any component (for example `(127\\.\\d+\\.\\d+\\.\\d+)` in the hostname) is rejected, because it is not enforced on redirects or subresources; use an exact value or a `*`/`:name` wildcard instead.",
     conflicts: ['allowedUrlPattern'],
+    coerce: (arg: string[] | undefined) => {
+      if (arg === undefined) {
+        return undefined;
+      }
+      const pattern = findUnenforceablePattern(arg);
+      if (pattern) {
+        throw new Error(
+          `Invalid --blockedUrlPattern "${pattern}": a regexp group is not enforced on redirects or subresources. Use an exact value or a "*"/":name" wildcard instead.`,
+        );
+      }
+      return arg;
+    },
   },
   allowedUrlPattern: {
     type: 'array',
     string: true,
     describe:
-      "Restricts browser's network access by allowing only specified URL patterns (uses https://urlpattern.spec.whatwg.org/). Requires Chrome 149+. Silently detaches from targets with unallowed URLs upon connection, and blocks runtime requests (including navigations and subresources). Accepts an array of patterns.",
+      "Restricts browser's network access by allowing only specified URL patterns (uses https://urlpattern.spec.whatwg.org/). Requires Chrome 149+. Silently detaches from targets with unallowed URLs upon connection, and blocks runtime requests (including navigations and subresources). Accepts an array of patterns. A pattern that uses a regexp group in any component (for example `(127\\.\\d+\\.\\d+\\.\\d+)` in the hostname) is rejected, because it is not enforced on redirects or subresources; use an exact value or a `*`/`:name` wildcard instead.",
     conflicts: ['blockedUrlPattern'],
+    coerce: (arg: string[] | undefined) => {
+      if (arg === undefined) {
+        return undefined;
+      }
+      const pattern = findUnenforceablePattern(arg);
+      if (pattern) {
+        throw new Error(
+          `Invalid --allowedUrlPattern "${pattern}": a regexp group is not enforced on redirects or subresources. Use an exact value or a "*"/":name" wildcard instead.`,
+        );
+      }
+      return arg;
+    },
   },
   performanceCrux: {
     type: 'boolean',
