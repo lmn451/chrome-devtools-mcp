@@ -13,12 +13,12 @@ import {
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {describe, it} from 'node:test';
 
+import {Client} from '@modelcontextprotocol/client';
+import {JSONRPCMessageSchema} from '@modelcontextprotocol/core';
+import {StdioClientTransport} from '@modelcontextprotocol/client/stdio';
 import {
-  Client,
   isJSONRPCNotification,
   isJSONRPCRequest,
-  JSONRPCMessageSchema,
-  StdioClientTransport,
   type JSONRPCMessage,
 } from '../src/third_party/index.js';
 

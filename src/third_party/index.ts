@@ -41,14 +41,10 @@ export {
   serveStdio,
 } from '@modelcontextprotocol/server/stdio';
 export type {Transport} from '@modelcontextprotocol/server';
-export {StdioClientTransport} from '@modelcontextprotocol/client/stdio';
+// The fork's stdio-to-HTTP proxy uses this transport at runtime.
+// eslint-disable-next-line no-restricted-imports -- required by the fork proxy
+export {StreamableHTTPClientTransport} from '@modelcontextprotocol/client';
 export {
-  Client,
-  StreamableHTTPClientTransport,
-  type ClientCapabilities,
-} from '@modelcontextprotocol/client';
-export {
-  JSONRPCMessageSchema,
   SetLevelRequestSchema,
   ListRootsRequestSchema,
   RootsListChangedNotificationSchema,

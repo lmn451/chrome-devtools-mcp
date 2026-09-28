@@ -14,10 +14,10 @@ import {pathToFileURL} from 'node:url';
 
 import {
   Client,
-  StdioClientTransport,
   StreamableHTTPClientTransport,
-  type Root,
-} from '../src/third_party/index.js';
+} from '@modelcontextprotocol/client';
+import {StdioClientTransport} from '@modelcontextprotocol/client/stdio';
+import type {Root} from '../src/third_party/index.js';
 import {executablePath} from 'puppeteer';
 
 import {parseArguments} from '../src/config/mcp-options.js';

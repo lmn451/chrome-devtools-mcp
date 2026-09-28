@@ -17,6 +17,7 @@ import {computeFlagUsage} from '../telemetry/flagUtils.js';
 import {StdioServerTransport} from '../third_party/index.js';
 import {checkForUpdates} from '../utils/check-for-updates.js';
 import {logger, saveLogsToFile} from '../utils/logger.js';
+import {setupUnhandledRejectionHandler} from '../utils/errorHandling.js';
 import {VERSION} from '../version.js';
 
 import {mcpOptions, parseArguments} from '../config/mcp-options.js';
@@ -32,11 +33,9 @@ const serverUrl = args.serverUrl ? new URL(args.serverUrl) : undefined;
 const isHttpMode = serverUrl === undefined && args.httpPort !== undefined;
 const isProxyMode = serverUrl !== undefined;
 
-if (process.env['CHROME_DEVTOOLS_MCP_CRASH_ON_UNCAUGHT'] !== 'true') {
-  process.on('unhandledRejection', (reason, promise) => {
-    logger?.('Unhandled promise rejection', promise, reason);
-  });
-}
+setupUnhandledRejectionHandler(() => {
+  process.exit(1);
+});
 
 logger?.(`Starting Chrome DevTools MCP Server v${VERSION}`);
 let shuttingDown = false;
