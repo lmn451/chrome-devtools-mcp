@@ -68,6 +68,8 @@ export {
   KnownDevices,
   CDPSessionEvent,
   ScreenRecorder,
+  Target,
+  TargetType,
   TimeoutError,
 } from 'puppeteer-core';
 export {default as puppeteer} from 'puppeteer-core';
