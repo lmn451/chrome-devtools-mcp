@@ -16,7 +16,11 @@ import {DevTools, Locator} from '../src/third_party/index.js';
 import type {JSONSchema7Definition} from '../src/third_party/index.js';
 import {TextSnapshot} from '../src/TextSnapshot.js';
 import type {TextSnapshotNode} from '../src/types.js';
-import {createMockPuppeteerPage, createMockPuppeteerTarget} from './mocks.js';
+import {
+  createMockMcpResponse,
+  createMockPuppeteerPage,
+  createMockPuppeteerTarget,
+} from './mocks.js';
 import {serverHooks} from './server.js';
 import {getMockRequest, html, withMcpContext} from './utils.js';
 
@@ -1209,6 +1213,46 @@ describe('McpPage', () => {
           assert.ok(selectors.includes('.frame-btn'));
         }
       });
+    });
+  });
+
+  describe('executeThirdPartyDeveloperTool()', () => {
+    afterEach(() => {
+      sinon.restore();
+    });
+
+    it('appends "Tool returned no result." and skips cleanup evaluate when the tool returns undefined and stashed is 0', async () => {
+      const {mcpPage, pptrPage} = await createMcpPage();
+      const response = createMockMcpResponse();
+      pptrPage.evaluate.resolves({result: undefined, stashed: 0});
+
+      await mcpPage.executeThirdPartyDeveloperTool('my-tool', {}, response);
+
+      sinon.assert.calledOnce(pptrPage.evaluate);
+      sinon.assert.calledOnceWithExactly(
+        response.appendResponseLine,
+        'Tool returned no result.',
+      );
+    });
+
+    it('preserves the original evaluateHandle error when stashedElements cleanup fails', async () => {
+      const {mcpPage, pptrPage} = await createMcpPage();
+      const response = createMockMcpResponse();
+      pptrPage.evaluate
+        .onFirstCall()
+        .resolves({result: '{"stashedId":"stashed-0"}', stashed: 1});
+      pptrPage.evaluateHandle.rejects(
+        new Error('Execution context was destroyed'),
+      );
+      pptrPage.evaluate.onSecondCall().rejects(new Error('Target closed'));
+
+      await assert.rejects(
+        () => mcpPage.executeThirdPartyDeveloperTool('my-tool', {}, response),
+        /Execution context was destroyed/,
+      );
+
+      sinon.assert.calledTwice(pptrPage.evaluate);
+      sinon.assert.notCalled(response.appendResponseLine);
     });
   });
 });
