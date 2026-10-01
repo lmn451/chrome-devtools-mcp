@@ -8,17 +8,19 @@ import assert from 'node:assert/strict';
 import {request as httpRequest} from 'node:http';
 import {describe, it} from 'node:test';
 
-import {parser} from '../src/config/mcp-options.js';
+import {ConfigParser} from '../src/config/ConfigParser.js';
 import {startMcpHttpServer} from '../src/http-server.js';
 
 const ACCEPT_HEADER = 'application/json, text/event-stream';
 const PROTOCOL_VERSION = '2025-03-26';
 
-const serverArgs = parser(
+const configParser = new ConfigParser(
   '0.0.0',
   ['node', 'http-server.test.js', '--no-usage-statistics'],
   {},
-).parseSync();
+  false,
+);
+const serverArgs = configParser.applyDefaults(configParser.parseCliArgs());
 
 const initializeMessage = {
   jsonrpc: '2.0',

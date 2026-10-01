@@ -48,8 +48,9 @@ import type {
   SupportedExtensions,
 } from './tools/ToolDefinition.js';
 import type {Logger} from './types.js';
-import type {ExtensionServiceWorker} from './types.js';
+import {McpWorker} from './McpWorker.js';
 import {getTempFilePath, resolveCanonicalPath} from './utils/files.js';
+import {escapeForLog} from './utils/logger.js';
 import {isAllowedUrl} from './utils/url.js';
 interface McpContextOptions {
   // Whether the DevTools windows are exposed as pages for debugging of DevTools.
@@ -94,7 +95,9 @@ export class McpContext implements Context {
   // Auto-generated name counter for when no name is provided.
   #nextIsolatedContextId = 1;
 
-  #extensionServiceWorkers: ExtensionServiceWorker[] = [];
+  // Cached McpWorker per target, reused across snapshots (mirrors #mcpPages) so
+  // referential identity holds and workers can carry per-worker state later.
+  #workers = new Map<Target, McpWorker>();
 
   #mcpPages = new Map<Target, McpPage>();
   #selectedPage?: McpPage;
@@ -109,9 +112,6 @@ export class McpContext implements Context {
   #disposePromise?: Promise<void>;
 
   #reconnectNotice = false;
-
-  #extensionServiceWorkerMap = new WeakMap<Target, string>();
-  #nextExtensionServiceWorkerId = 1;
 
   #traceResults: TraceResult[] = [];
 
@@ -143,7 +143,7 @@ export class McpContext implements Context {
 
   async #init() {
     await this.createPagesSnapshot();
-    const workers = await this.createExtensionServiceWorkersSnapshot();
+    const workers = this.createWorkersSnapshot();
 
     await this.#serviceWorkerConsoleCollector.init(workers);
     this.browser.on('targetcreated', this.#onTargetCreated);
@@ -154,7 +154,6 @@ export class McpContext implements Context {
     if (this.#disposePromise !== undefined) {
       return await this.#disposePromise;
     }
-
     const disposePromise = (async (): Promise<void> => {
       const recorderData = this.#screenRecorderData;
       this.#screenRecorderData = null;
@@ -195,6 +194,7 @@ export class McpContext implements Context {
       }
       selectedPage?.dispose();
       this.#mcpPages.clear();
+      this.#workers.clear();
       // Keep isolated contexts alive across disconnects, as upstream does.
       this.#isolatedContexts.clear();
     })();
@@ -220,6 +220,7 @@ export class McpContext implements Context {
         mcpPage.dispose();
         this.#mcpPages.delete(target);
       }
+      this.#workers.delete(target);
     } catch (err) {
       this.logger?.('Error handling targetdestroyed', err);
     }
@@ -239,6 +240,10 @@ export class McpContext implements Context {
 
   static resetPageIdsForTesting(): void {
     nextPageId = 1;
+  }
+
+  static resetWorkerIdsForTesting(): void {
+    McpWorker.resetIdsForTesting();
   }
 
   roots(): Root[] {
@@ -275,10 +280,10 @@ export class McpContext implements Context {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       console.error(
-        `[MCP Context] Error resolving real path for ${filePath}: ${errMsg}`,
+        `[MCP Context] Error resolving real path for ${escapeForLog(filePath)}: ${escapeForLog(errMsg)}`,
       );
       throw new Error(
-        `Access denied: Cannot resolve base path for ${filePath}.`,
+        `Access denied: Cannot resolve base path for ${escapeForLog(filePath)}.`,
       );
     }
 
@@ -323,7 +328,7 @@ export class McpContext implements Context {
         const errMsg =
           rootErr instanceof Error ? rootErr.message : String(rootErr);
         console.warn(
-          `[MCP Context] Could not resolve configured root ${root.uri}: ${errMsg}`,
+          `[MCP Context] Could not resolve configured root ${escapeForLog(root.uri)}: ${escapeForLog(errMsg)}`,
         );
         // Skip this root if it cannot be resolved.
       }
@@ -331,7 +336,7 @@ export class McpContext implements Context {
 
     if (!allowed) {
       throw new Error(
-        `Access denied: path ${filePath} (canonical: ${canonicalPath}) is not within any of the configured workspace roots.`,
+        `Access denied: path ${escapeForLog(filePath)} (canonical: ${escapeForLog(canonicalPath)}) is not within any of the configured workspace roots.`,
       );
     }
 
@@ -531,38 +536,35 @@ export class McpContext implements Context {
   }
 
   /**
-   * Creates a snapshot of the extension service workers.
+   * Creates a snapshot of the tracked workers. Today this is limited to
+   * extension service workers; the McpWorker abstraction lets dedicated and
+   * shared workers join the same snapshot later without changing consumers.
    */
-  async createExtensionServiceWorkersSnapshot(): Promise<
-    ExtensionServiceWorker[]
-  > {
-    const allTargets = this.browser.targets();
-
-    const serviceWorkers = allTargets.filter(target => {
+  createWorkersSnapshot(): McpWorker[] {
+    const serviceWorkers = this.browser.targets().filter(target => {
       return (
         target.type() === 'service_worker' &&
         target.url().includes('chrome-extension://')
       );
     });
 
-    for (const serviceWorker of serviceWorkers) {
-      if (!this.#extensionServiceWorkerMap.has(serviceWorker)) {
-        this.#extensionServiceWorkerMap.set(
-          serviceWorker,
-          'sw-' + this.#nextExtensionServiceWorkerId++,
-        );
+    // Reuse the existing McpWorker for a target; only mint one (and an id) for
+    // targets seen for the first time.
+    for (const target of serviceWorkers) {
+      if (!this.#workers.has(target)) {
+        this.#workers.set(target, McpWorker.create('service_worker', target));
       }
     }
 
-    this.#extensionServiceWorkers = serviceWorkers.map(serviceWorker => {
-      return {
-        target: serviceWorker,
-        id: this.#extensionServiceWorkerMap.get(serviceWorker)!,
-        url: serviceWorker.url(),
-      };
-    });
+    // Prune workers whose target is gone (mirrors #mcpPages pruning).
+    const currentTargets = new Set(serviceWorkers);
+    for (const target of this.#workers.keys()) {
+      if (!currentTargets.has(target)) {
+        this.#workers.delete(target);
+      }
+    }
 
-    return this.#extensionServiceWorkers;
+    return Array.from(this.#workers.values());
   }
 
   getServiceWorkerConsoleData(
@@ -694,14 +696,12 @@ export class McpContext implements Context {
     return this.browser.targets().filter(target => this.#isPageTarget(target));
   }
 
-  getExtensionServiceWorkers(): ExtensionServiceWorker[] {
-    return this.#extensionServiceWorkers;
+  getWorkers(): McpWorker[] {
+    return Array.from(this.#workers.values());
   }
 
-  getExtensionServiceWorkerId(
-    extensionServiceWorker: ExtensionServiceWorker,
-  ): string | undefined {
-    return this.#extensionServiceWorkerMap.get(extensionServiceWorker.target);
+  getWorkerById(id: string): McpWorker | undefined {
+    return this.#workers.values().find(worker => worker.id === id);
   }
 
   async #writeFile(
@@ -727,7 +727,9 @@ export class McpContext implements Context {
         mode: 0o600,
       });
     } catch (err) {
-      throw new Error(`Could not write ${filepath}`, {cause: err});
+      throw new Error(`Could not write ${escapeForLog(filepath)}`, {
+        cause: err,
+      });
     }
   }
 

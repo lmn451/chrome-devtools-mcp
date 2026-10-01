@@ -20,7 +20,7 @@ import {StdioClientTransport} from '@modelcontextprotocol/client/stdio';
 import type {Root} from '../src/third_party/index.js';
 import {executablePath} from 'puppeteer';
 
-import {parseArguments} from '../src/config/mcp-options.js';
+import {ConfigParser} from '../src/config/ConfigParser.js';
 import {startMcpHttpServer} from '../src/http-server.js';
 import {VERSION} from '../src/version.js';
 import {createTempDir} from './utils.js';
@@ -266,7 +266,7 @@ describe('shared-browser HTTP MCP service', () => {
     );
 
     try {
-      const serverArgs = parseArguments(
+      const configParser = new ConfigParser(
         VERSION,
         [
           'node',
@@ -278,6 +278,10 @@ describe('shared-browser HTTP MCP service', () => {
           '--no-usage-statistics',
         ],
         {},
+        false,
+      );
+      const serverArgs = configParser.applyDefaults(
+        configParser.parseCliArgs(),
       );
       service = await startMcpHttpServer(serverArgs, {port: 0});
       const root: Root = {

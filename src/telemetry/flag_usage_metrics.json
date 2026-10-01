@@ -459,6 +459,14 @@
     "flagType": "boolean"
   },
   {
+    "name": "file_navigations_present",
+    "flagType": "boolean"
+  },
+  {
+    "name": "file_navigations",
+    "flagType": "boolean"
+  },
+  {
     "name": "http_port_present",
     "flagType": "boolean"
   },

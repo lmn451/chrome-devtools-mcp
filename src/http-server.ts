@@ -20,7 +20,7 @@ import {
   isInitializeRequest,
   WebStandardStreamableHTTPServerTransport,
 } from './third_party/index.js';
-import type {ParsedArguments} from './config/mcp-options.js';
+import type {ParsedArguments} from './config/ConfigParser.js';
 import {logger} from './utils/logger.js';
 
 const MCP_PATH = '/mcp';
