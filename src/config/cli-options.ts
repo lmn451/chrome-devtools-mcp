@@ -364,7 +364,7 @@ export const commands: Commands = {
   },
   execute_3p_developer_tool: {
     description:
-      'Executes a tool exposed by the page. (requires flag: --categoryExperimentalThirdParty=true)',
+      'Executes a third-party developer tool exposed by the page. (requires flag: --categoryExperimentalThirdParty=true)',
     category: 'Third-party',
     args: {
       pageId: {
@@ -389,7 +389,7 @@ export const commands: Commands = {
   },
   execute_webmcp_tool: {
     description:
-      'Executes a WebMCP tool exposed by the page. (requires flag: --categoryExperimentalWebmcp=true)',
+      "Executes a WebMCP tool exposed by the page (for debugging tools, use 'execute_3p_developer_tool'). (requires flag: --categoryExperimentalWebmcp=true)",
     category: 'WebMCP',
     args: {
       pageId: {
@@ -1056,7 +1056,7 @@ export const commands: Commands = {
   },
   list_3p_developer_tools: {
     description:
-      "Lists all third-party developer tools the page exposes for providing runtime information.\nThird-party developer tools can be called via the 'execute_3p_developer_tool()' MCP tool.\nAlternatively, third-party developer tools can be executed by calling 'evaluate_script' and adding the\nfollowing command to the script:\n`window.__dtmcp.executeTool(toolName, params)`\nThis might be helpful when the third-party developer tools return non-serializable values or when composing\nthird-party developer tools with additional functionality. (requires flag: --categoryExperimentalThirdParty=true)",
+      "Lists all third-party developer tools the page exposes for providing runtime information (including debugging WebMCP tools and tools exposed via the 'devtoolstooldiscovery' event).\nThird-party developer tools can be called via the 'execute_3p_developer_tool()' MCP tool.\nAlternatively, third-party developer tools exposed via the 'devtoolstooldiscovery' event can be executed by calling 'evaluate_script' and adding the\nfollowing command to the script:\n`window.__dtmcp.executeTool(toolName, params)`\nThis might be helpful when the third-party developer tools return non-serializable values or when composing\nthird-party developer tools with additional functionality. (requires flag: --categoryExperimentalThirdParty=true)",
     category: 'Third-party',
     args: {
       pageId: {
@@ -1180,7 +1180,7 @@ export const commands: Commands = {
   },
   list_webmcp_tools: {
     description:
-      'Lists all WebMCP tools the page exposes. (requires flag: --categoryExperimentalWebmcp=true)',
+      "Lists all WebMCP tools the page exposes (excluding debugging tools, which are exposed via 'list_3p_developer_tools'). (requires flag: --categoryExperimentalWebmcp=true)",
     category: 'WebMCP',
     args: {
       pageId: {

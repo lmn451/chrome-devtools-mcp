@@ -120,7 +120,7 @@ Then connect to `http://127.0.0.1:9333/mcp` on the client side of the tunnel.
   - **Default:** `false`
 
 - **`--categoryExperimentalThirdParty`/ `--category-experimental-third-party`**
-  Set to true to enable third-party developer tools exposed by the inspected page itself
+  Set to true to enable third-party developer tools exposed by the inspected page itself (via WebMCP or devtoolstooldiscovery)
   - **Type:** boolean
   - **Default:** `false`
 
@@ -130,7 +130,7 @@ Then connect to `http://127.0.0.1:9333/mcp` on the client side of the tunnel.
   - **Default:** `true`
 
 - **`--categoryExperimentalWebmcp`/ `--category-experimental-webmcp`**
-  Set to true to enable debugging WebMCP tools. Requires Chrome 150+ with the following flag: `--enable-features=WebMCP`
+  Set to true to enable WebMCP tools (excluding debugging tools, which are exposed under the third-party developer tools category). Requires Chrome 150+ with the following flag: `--enable-features=WebMCP`
   - **Type:** boolean
   - **Default:** `false`
 

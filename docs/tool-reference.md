@@ -751,7 +751,7 @@ in the DevTools Elements panel (if any).
 
 ### `execute_3p_developer_tool`
 
-**Description:** Executes a tool exposed by the page. (requires flag: --categoryExperimentalThirdParty=true)
+**Description:** Executes a third-party developer tool exposed by the page. (requires flag: --categoryExperimentalThirdParty=true)
 
 **Parameters:**
 
@@ -763,9 +763,9 @@ in the DevTools Elements panel (if any).
 
 ### `list_3p_developer_tools`
 
-**Description:** Lists all third-party developer tools the page exposes for providing runtime information.
+**Description:** Lists all third-party developer tools the page exposes for providing runtime information (including debugging WebMCP tools and tools exposed via the 'devtoolstooldiscovery' event).
 Third-party developer tools can be called via the '[`execute_3p_developer_tool`](#execute_3p_developer_tool)()' MCP tool.
-Alternatively, third-party developer tools can be executed by calling '[`evaluate_script`](#evaluate_script)' and adding the
+Alternatively, third-party developer tools exposed via the 'devtoolstooldiscovery' event can be executed by calling '[`evaluate_script`](#evaluate_script)' and adding the
 following command to the script:
 `window.__dtmcp.executeTool(toolName, params)`
 This might be helpful when the third-party developer tools return non-serializable values or when composing
@@ -783,7 +783,7 @@ third-party developer tools with additional functionality. (requires flag: --cat
 
 ### `execute_webmcp_tool`
 
-**Description:** Executes a WebMCP tool exposed by the page. (requires flag: --categoryExperimentalWebmcp=true)
+**Description:** Executes a WebMCP tool exposed by the page (for debugging tools, use '[`execute_3p_developer_tool`](#execute_3p_developer_tool)'). (requires flag: --categoryExperimentalWebmcp=true)
 
 **Parameters:**
 
@@ -795,7 +795,7 @@ third-party developer tools with additional functionality. (requires flag: --cat
 
 ### `list_webmcp_tools`
 
-**Description:** Lists all WebMCP tools the page exposes. (requires flag: --categoryExperimentalWebmcp=true)
+**Description:** Lists all WebMCP tools the page exposes (excluding debugging tools, which are exposed via '[`list_3p_developer_tools`](#list_3p_developer_tools)'). (requires flag: --categoryExperimentalWebmcp=true)
 
 **Parameters:**
 

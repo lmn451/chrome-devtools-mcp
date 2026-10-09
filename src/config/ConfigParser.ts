@@ -188,7 +188,10 @@ export class ConfigParser {
     }
 
     if (isViaCli) {
-      if (resolvedArgs.filesystemRoot === DEFAULT_FILESYSTEM_ROOT) {
+      if (
+        resolvedArgs.filesystemRoot === DEFAULT_FILESYSTEM_ROOT &&
+        explicitArgs.allowUnrestrictedPaths !== false
+      ) {
         resolvedArgs.allowUnrestrictedPaths = true;
         resolvedArgs.filesystemRoot = undefined;
       }
