@@ -7,8 +7,10 @@
 import type {YargsOptions} from '../third_party/index.js';
 import os from 'node:os';
 import path from 'node:path';
-
-export const DEFAULT_FILESYSTEM_ROOT = [os.tmpdir()];
+import {getCategoryOptions} from './category-options.js';
+import {getBrowserOptions} from './browser-options.js';
+import {puppeteerOptions} from './puppeteer-options.js';
+import {toolOptions} from './tool-options.js';
 
 export function validateServerUrl(
   value: string | undefined,
@@ -46,10 +48,7 @@ function validateHttpPort(value: number | undefined): number | undefined {
   }
   return value;
 }
-import {getCategoryOptions} from './category-options.js';
-import {getBrowserOptions} from './browser-options.js';
-import {puppeteerOptions} from './puppeteer-options.js';
-import {toolOptions} from './tool-options.js';
+export const DEFAULT_FILESYSTEM_ROOT = [os.tmpdir()];
 
 export const mcpOptions = {
   ...getCategoryOptions(),

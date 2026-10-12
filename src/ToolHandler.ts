@@ -11,7 +11,7 @@ import type {McpPage} from './McpPage.js';
 import {McpResponse} from './McpResponse.js';
 import {SlimMcpResponse} from './SlimMcpResponse.js';
 import {ClearcutLogger} from './telemetry/ClearcutLogger.js';
-import type {Browser, CallToolResult} from './third_party/index.js';
+import type {Browser, CallToolResult, Mutex} from './third_party/index.js';
 import {zod} from './third_party/index.js';
 import {labels} from './tools/categories.js';
 import {categoryToFlagName} from './config/category-options.js';
@@ -23,7 +23,6 @@ import type {
 } from './tools/ToolDefinition.js';
 import {isAvailableInMode, isSlimTool} from './tools/ToolDefinition.js';
 import {logger} from './utils/logger.js';
-import type {Mutex} from './third_party/index.js';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {isLocalhost} from './utils/url.js';
 
@@ -108,7 +107,8 @@ async function validateAndResolvePathOrUrl(
     const url = new URL(filePathOrUrl);
     if (url.protocol === 'file:') {
       return pathToFileURL(await context.validatePath(fileURLToPath(url))).href;
-    } else if (['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) {
+    }
+    if (['http:', 'https:', 'ws:', 'wss:'].includes(url.protocol)) {
       return filePathOrUrl;
     }
   } catch {
@@ -236,7 +236,7 @@ export class ToolHandler {
   }
 
   handle = async (params: Record<string, unknown>): Promise<CallToolResult> => {
-    using _guard = await this.toolMutex.acquire();
+    using guard = await this.toolMutex.acquire();
 
     if (this.disabledReason) {
       return {

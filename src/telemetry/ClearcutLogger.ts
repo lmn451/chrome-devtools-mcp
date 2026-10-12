@@ -91,25 +91,35 @@ function getMcpClient(clientName: string): McpClient {
   const lowerName = clientName.toLowerCase();
   if (lowerName.includes('claude-desktop')) {
     return McpClient.MCP_CLIENT_CLAUDE_DESKTOP;
-  } else if (lowerName.includes('claude')) {
+  }
+  if (lowerName.includes('claude')) {
     return McpClient.MCP_CLIENT_CLAUDE_CODE;
-  } else if (lowerName.includes('gemini')) {
+  }
+  if (lowerName.includes('gemini')) {
     return McpClient.MCP_CLIENT_GEMINI_CLI;
-  } else if (clientName === DAEMON_CLIENT_NAME) {
+  }
+  if (clientName === DAEMON_CLIENT_NAME) {
     return McpClient.MCP_CLIENT_DT_MCP_CLI;
-  } else if (lowerName.includes('openclaw')) {
+  }
+  if (lowerName.includes('openclaw')) {
     return McpClient.MCP_CLIENT_OPENCLAW;
-  } else if (lowerName.includes('opencode')) {
+  }
+  if (lowerName.includes('opencode')) {
     return McpClient.MCP_CLIENT_OPENCODE;
-  } else if (lowerName.includes('codex')) {
+  }
+  if (lowerName.includes('codex')) {
     return McpClient.MCP_CLIENT_CODEX;
-  } else if (lowerName.includes('antigravity')) {
+  }
+  if (lowerName.includes('antigravity')) {
     return McpClient.MCP_CLIENT_ANTIGRAVITY;
-  } else if (lowerName.includes('grok') || lowerName.includes('xai')) {
+  }
+  if (lowerName.includes('grok') || lowerName.includes('xai')) {
     return McpClient.MCP_CLIENT_GROK;
-  } else if (lowerName.includes('copilot')) {
+  }
+  if (lowerName.includes('copilot')) {
     return McpClient.MCP_CLIENT_GITHUB_COPILOT;
-  } else if (lowerName.includes('hermes-agent')) {
+  }
+  if (lowerName.includes('hermes-agent')) {
     return McpClient.MCP_CLIENT_HERMES;
   }
   return McpClient.MCP_CLIENT_OTHER;
