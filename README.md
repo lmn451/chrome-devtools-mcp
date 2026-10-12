@@ -2,6 +2,38 @@
 
 [![npm chrome-devtools-mcp package](https://img.shields.io/npm/v/chrome-devtools-mcp.svg)](https://npmjs.org/package/chrome-devtools-mcp)
 
+## Fork-specific additions
+
+This fork follows [upstream Chrome DevTools MCP](https://github.com/ChromeDevTools/chrome-devtools-mcp) and adds a shared Streamable HTTP service plus a stdio-to-HTTP proxy:
+
+- **Share one browser service:** Run one MCP process with `--http-port=<port>`
+  and connect native Streamable HTTP clients to
+  `http://127.0.0.1:<port>/mcp`.
+- **Isolate client state:** Each HTTP client gets its own MCP session and
+  context, including its selected page, filesystem roots, and trace/recording
+  state. Chrome and its pages remain shared, so browser changes are visible to
+  every client; disconnecting one client closes only its session.
+- **Support stdio-only clients:** Point `--server-url=<URL>` or
+  `CHROME_DEVTOOLS_MCP_SERVER_URL` at the shared endpoint. The proxy forwards
+  MCP traffic and terminates its remote session when the stdio client exits.
+- **Keep the endpoint local:** The server binds to `127.0.0.1` and rejects
+  non-loopback `Host` and `Origin` values. Use SSH port forwarding for remote
+  clients; anyone who can control the endpoint can control Chrome.
+
+See the [HTTP configuration guide](./docs/configuration.md#shared-http-server-and-stdio-proxy) for options and the [advanced shared-server guide](./docs/advanced-usage.md#shared-server-for-multiple-mcp-clients) for setup and session details.
+
+The `chrome-devtools-mcp@latest` examples elsewhere in this README install the
+upstream npm package, not this GitHub fork. To try the fork-specific features,
+build this repository:
+
+```bash
+git clone https://github.com/lmn451/chrome-devtools-mcp.git
+cd chrome-devtools-mcp
+npm ci
+npm run build
+node build/src/bin/chrome-devtools-mcp.js --http-port=9333 --headless=true --isolated=true
+```
+
 Chrome DevTools for agents (`chrome-devtools-mcp`) lets your coding agent (such as Antigravity, Claude, Cursor or Copilot)
 control and inspect a live Chrome browser. It acts as a Model-Context-Protocol
 (MCP) server, giving your AI coding assistant access to the full power of
