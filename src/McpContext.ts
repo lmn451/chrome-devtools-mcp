@@ -155,6 +155,10 @@ export class McpContext implements Context {
       return await this.#disposePromise;
     }
     const disposePromise = (async (): Promise<void> => {
+      this.browser.off('targetcreated', this.#onTargetCreated);
+      this.browser.off('targetdestroyed', this.#onTargetDestroyed);
+      this.#serviceWorkerConsoleCollector.dispose();
+
       const recorderData = this.#screenRecorderData;
       this.#screenRecorderData = null;
       if (recorderData !== null) {
@@ -182,9 +186,6 @@ export class McpContext implements Context {
         }
       }
 
-      this.browser.off('targetcreated', this.#onTargetCreated);
-      this.browser.off('targetdestroyed', this.#onTargetDestroyed);
-      this.#serviceWorkerConsoleCollector.dispose();
       this.#heapSnapshotManager.dispose();
       const selectedPage = this.#selectedPage;
       for (const mcpPage of this.#mcpPages.values()) {
