@@ -5,6 +5,7 @@
  */
 
 import assert from 'node:assert';
+import {EventEmitter} from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -46,6 +47,45 @@ const EXTENSION_CONTENT_SCRIPT_PATH = path.join(
 describe('McpContext', () => {
   afterEach(() => {
     sinon.restore();
+  });
+
+  it('detaches target handlers before stopping an active recorder', async () => {
+    const browserEvents = new EventEmitter();
+    const browser = Object.assign(browserEvents, {
+      targets: () => [],
+    }) as unknown as Parameters<typeof McpContext.from>[0];
+    const context = await McpContext.from(
+      browser,
+      undefined,
+      {
+        experimentalDevToolsDebugging: false,
+        performanceCrux: false,
+      },
+      Locator,
+    );
+
+    let listenerCountsDuringStop: [number, number] | undefined;
+    const recorder = {
+      stop: async (): Promise<void> => {
+        listenerCountsDuringStop = [
+          browserEvents.listenerCount('targetcreated'),
+          browserEvents.listenerCount('targetdestroyed'),
+        ];
+      },
+    } as unknown as NonNullable<
+      Parameters<typeof context.setScreenRecorder>[0]
+    >['recorder'];
+    context.setScreenRecorder({recorder, filePath: 'unused.webm'});
+
+    await context.dispose();
+
+    assert.deepEqual(
+      listenerCountsDuringStop,
+      [0, 0],
+      'all target handlers should be removed before awaiting recorder shutdown',
+    );
+    assert.strictEqual(browserEvents.listenerCount('targetcreated'), 0);
+    assert.strictEqual(browserEvents.listenerCount('targetdestroyed'), 0);
   });
 
   it('list pages', async () => {
