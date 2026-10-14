@@ -133,6 +133,9 @@ export function mockListener() {
         listener(data);
       }
     },
+    listenerCount(eventName: string | symbol | number) {
+      return listeners[eventName]?.length ?? 0;
+    },
   };
 }
 
@@ -178,6 +181,7 @@ export function createMockPuppeteerPage(): sinon.SinonStubbedInstance<Page> & {
     CdpPage,
   ) as unknown as sinon.SinonStubbedInstance<Page>;
   const pageListener = mockListener();
+  page.listenerCount.callsFake(pageListener.listenerCount);
   page.on.callsFake((eventName, handler) => {
     pageListener.on(eventName, handler);
     return page;
@@ -420,6 +424,7 @@ export function createMockMcpContext(
   const context = sinon.createStubInstance(McpContext);
   const page = options.selectedPage ?? createMockMcpPage();
   context.getSelectedMcpPage.returns(page satisfies McpPage);
+  context.getTargetInfos.resolves(new Map());
 
   return context;
 }

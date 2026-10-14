@@ -7,7 +7,7 @@
 import assert from 'node:assert';
 import {readFile} from 'node:fs/promises';
 import {join} from 'node:path';
-import {describe, it} from 'node:test';
+import {afterEach, describe, it} from 'node:test';
 
 import sinon from 'sinon';
 
@@ -53,6 +53,7 @@ import {
   createMockMcpWorker,
   createMockObjectInfo,
   createMockParsedArguments,
+  createMockPuppeteerTarget,
 } from './mocks.js';
 import {
   createTempDir,
@@ -68,6 +69,58 @@ import {
 } from './utils.js';
 
 describe('McpResponse', () => {
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  it('reports only pages opened by the attached action', async () => {
+    const openedTarget = createMockPuppeteerTarget({
+      url: 'https://example.com/opened',
+      title: 'Opened page',
+    });
+    const openedPage = createMockMcpPage({target: openedTarget});
+    const unrelatedPage = createMockMcpPage();
+    Object.defineProperty(openedPage, 'id', {value: 2});
+    openedPage.url.returns('https://example.com/opened');
+    openedPage.getTitle.returns('Opened page');
+    Object.defineProperty(unrelatedPage, 'id', {value: 3});
+    unrelatedPage.url.returns('https://example.com/unrelated');
+    unrelatedPage.getTitle.returns('Unrelated page');
+
+    const context = createMockMcpContext();
+    const targetInfo = openedTarget._getTargetInfo();
+    context.getTargetInfos.resolves(
+      new Map([[targetInfo.targetId, targetInfo]]),
+    );
+    context.getPages.returns([openedPage, unrelatedPage]);
+    context.isPageSelected.returns(false);
+    const response = new McpResponse(createMockParsedArguments());
+    response.attachWaitForResult({
+      openedPages: new Set([openedPage.target]),
+    });
+
+    const result = await response.handle(context);
+
+    sinon.assert.calledOnceWithExactly(context.createPagesSnapshot);
+    sinon.assert.calledOnceWithExactly(context.getTargetInfos);
+    sinon.assert.calledOnceWithExactly(openedPage.getTitle, targetInfo);
+    assert.match(
+      getTextContent(result.content[0]),
+      /## Opened pages\n2: Opened page \(https:\/\/example\.com\/opened\)/,
+    );
+    assert.ok(!getTextContent(result.content[0]).includes('Unrelated page'));
+    assert.deepStrictEqual(result.structuredContent, {
+      openedPages: [
+        {
+          id: 2,
+          url: 'https://example.com/opened',
+          title: 'Opened page',
+          selected: false,
+        },
+      ],
+    });
+  });
+
   it('list pages', async t => {
     await withMcpContext(async (response, context) => {
       response.setIncludePages(true);
@@ -261,6 +314,35 @@ describe('McpResponse', () => {
 
   describe('navigation', () => {
     const server = serverHooks();
+
+    it('lists current page titles', async () => {
+      await withMcpContext(async (response, context) => {
+        server.addHtmlRoute(
+          '/titled.html',
+          '<!doctype html><title>Real Title</title><h1>Titled</h1>',
+        );
+        const page = context.getSelectedMcpPage().pptrPage;
+        await page.goto(server.getRoute('/titled.html'));
+
+        response.setIncludePages(true);
+        const res1 = await response.handle(context);
+        assert.ok(
+          getTextContent(res1.content[0]).includes(
+            `Real Title (${server.getRoute('/titled.html')})`,
+          ),
+        );
+
+        await page.evaluate(() => {
+          document.title = 'Changed By Script';
+        });
+        const res2 = await response.handle(context);
+        assert.ok(
+          getTextContent(res2.content[0]).includes(
+            `Changed By Script (${server.getRoute('/titled.html')})`,
+          ),
+        );
+      });
+    });
 
     it('resets ids after navigation', async () => {
       await withMcpContext(async (response, context) => {
@@ -916,6 +998,39 @@ describe('lighthouse', () => {
             total: 1000,
           },
         },
+        failedAudits: [
+          {
+            id: 'color-contrast',
+            title:
+              'Background and foreground colors do not have a sufficient contrast ratio.',
+            description: 'Low-contrast text is difficult to read.',
+            score: 0,
+            categories: ['accessibility'],
+            nodes: [
+              {
+                selector: 'body > p',
+                snippet: '<p class="faint">',
+                nodeLabel: 'Hello',
+                explanation:
+                  'Fix any of the following:\n  Element has insufficient color contrast',
+              },
+              {
+                selector: 'a[title="Say \\"hi\\""]',
+                snippet: '<a title="Say &quot;hi&quot;">',
+                nodeLabel: 'Say "hi"\nnow',
+              },
+            ],
+            totalNodes: 12,
+          },
+          {
+            id: 'document-title',
+            title: 'Document does not have a `<title>` element',
+            score: 0,
+            categories: ['accessibility', 'seo'],
+            nodes: [],
+            totalNodes: 0,
+          },
+        ],
         reports: ['/tmp/report.json', '/tmp/report.html'],
       };
 
@@ -923,6 +1038,7 @@ describe('lighthouse', () => {
       const {content, structuredContent} = await response.handle(context);
 
       const text = getTextContent(content[0]);
+      assert.ok(text.includes('### Failed audits'));
       assert.ok(text.includes('### Reports'));
       assert.ok(text.includes('- /tmp/report.json'));
       assert.ok(text.includes('- /tmp/report.html'));
@@ -964,6 +1080,7 @@ describe('lighthouse', () => {
             total: 1000,
           },
         },
+        failedAudits: [],
         reports: ['/tmp/report.json', '/tmp/report.html'],
       };
 

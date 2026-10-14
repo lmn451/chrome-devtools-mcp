@@ -49,6 +49,7 @@ import type {
   TextContent,
   Extension,
   HTTPRequest,
+  Protocol,
 } from './third_party/index.js';
 import {handleDialog, listPages} from './tools/pages.js';
 import type {ToolGroups} from './tools/thirdPartyDeveloper.js';
@@ -775,6 +776,10 @@ export class McpResponse implements Response {
     content: Array<TextContent | ImageContent>;
     structuredContent: object;
   }> {
+    if (this.#attachedWaitForResult?.openedPages && !this.#includePages) {
+      await context.createPagesSnapshot();
+    }
+
     const [
       snapshot,
       detailedNetworkRequest,
@@ -894,6 +899,7 @@ export class McpResponse implements Response {
         defaultValue?: string;
       };
       pages?: object[];
+      openedPages?: object[];
       pagination?: object;
       heapSnapshot?: {
         stats?: object;
@@ -969,6 +975,28 @@ export class McpResponse implements Response {
         );
         structuredContent.navigatedToUrl =
           this.#attachedWaitForResult.navigatedToUrl;
+      }
+      if (this.#attachedWaitForResult.openedPages) {
+        const openedPages = this.#attachedWaitForResult.openedPages;
+        const openedMcpPages = context
+          .getPages()
+          .filter(mcpPage => openedPages.has(mcpPage.target));
+
+        if (openedMcpPages.length) {
+          const targetInfos = await context.getTargetInfos();
+          response.push('## Opened pages');
+          const structuredPages = [];
+          for (const mcpPage of openedMcpPages) {
+            const page = formatPage(
+              mcpPage,
+              context,
+              targetInfos.get(mcpPage.targetId),
+            );
+            response.push(page.text);
+            structuredPages.push(page.structured);
+          }
+          structuredContent.openedPages = structuredPages;
+        }
       }
     }
 
@@ -1080,6 +1108,11 @@ Call ${handleDialog(this.#args).name} to handle it before continuing.`);
           `Note: the previously selected page ${selectionFallback.wasClosed ? 'was closed' : 'is no longer listed'}.${selectedPageId !== undefined ? ` Page ${selectedPageId} is now selected.` : ''}`,
         );
       }
+      const targetInfos =
+        regularPages.length ||
+        (this.#includeExtensionPages && extensionPages.length)
+          ? await context.getTargetInfos()
+          : new Map<string, Protocol.Target.TargetInfo>();
       if (regularPages.length) {
         const parts = [`## Pages`];
         const structuredPages = [];
@@ -1088,14 +1121,15 @@ Call ${handleDialog(this.#args).name} to handle it before continuing.`);
           const contextLabel = isolatedContextName
             ? ` isolatedContext=${isolatedContextName}`
             : '';
-          const title = mcpPage.getTitle();
-          const pageLabel = title
-            ? `${truncateTitle(title)} (${mcpPage.url()})`
-            : mcpPage.url();
-          parts.push(
-            `${mcpPage.id}: ${pageLabel}${context.isPageSelected(mcpPage) ? ' [selected]' : ''}${contextLabel}`,
+          const page = formatPage(
+            mcpPage,
+            context,
+            targetInfos.get(mcpPage.targetId),
           );
-          structuredPages.push(createStructuredPage(mcpPage, context, title));
+          parts.push(
+            `${page.text}${context.isPageSelected(mcpPage) ? ' [selected]' : ''}${contextLabel}`,
+          );
+          structuredPages.push(page.structured);
         }
         response.push(...parts);
         structuredContent.pages = structuredPages;
@@ -1110,16 +1144,15 @@ Call ${handleDialog(this.#args).name} to handle it before continuing.`);
             const contextLabel = isolatedContextName
               ? ` isolatedContext=${isolatedContextName}`
               : '';
-            const title = mcpPage.getTitle();
-            const pageLabel = title
-              ? `${truncateTitle(title)} (${mcpPage.url()})`
-              : mcpPage.url();
+            const page = formatPage(
+              mcpPage,
+              context,
+              targetInfos.get(mcpPage.targetId),
+            );
             response.push(
-              `${mcpPage.id}: ${pageLabel}${context.isPageSelected(mcpPage) ? ' [selected]' : ''}${contextLabel}`,
+              `${page.text}${context.isPageSelected(mcpPage) ? ' [selected]' : ''}${contextLabel}`,
             );
-            structuredExtensionPages.push(
-              createStructuredPage(mcpPage, context, title),
-            );
+            structuredExtensionPages.push(page.structured);
           }
           structuredContent.extensionPages = structuredExtensionPages;
         }
@@ -1190,12 +1223,12 @@ Call ${handleDialog(this.#args).name} to handle it before continuing.`);
 
     if (data.lighthouseResult) {
       structuredContent.lighthouseResult = data.lighthouseResult;
-      const {summary, reports} = data.lighthouseResult;
-      response.push('## Lighthouse Audit Results');
+      const {summary, failedAudits, reports} = data.lighthouseResult;
+      response.push('## Lighthouse audit results');
       response.push(`Mode: ${summary.mode}`);
       response.push(`Device: ${summary.device}`);
       response.push(`URL: ${summary.url}`);
-      response.push('### Category Scores');
+      response.push('### Category scores');
       for (const score of summary.scores) {
         // Lighthouse uses a null score for categories that could not be
         // scored and renders scores as Math.round(score * 100).
@@ -1203,10 +1236,56 @@ Call ${handleDialog(this.#args).name} to handle it before continuing.`);
           score.score === null ? 'n/a' : Math.round(score.score * 100);
         response.push(`- ${score.title}: ${formattedScore} (${score.id})`);
       }
-      response.push('### Audit Summary');
+      response.push('### Audit summary');
       response.push(`Passed: ${summary.audits.passed}`);
       response.push(`Failed: ${summary.audits.failed}`);
-      response.push(`Total Timing: ${summary.timing.total}ms`);
+      response.push(`Total timing: ${summary.timing.total}ms`);
+      if (failedAudits.length) {
+        response.push('### Failed audits');
+        for (const audit of failedAudits) {
+          const categories = audit.categories.length
+            ? ` [${audit.categories.join(', ')}]`
+            : '';
+          const displayValue = audit.displayValue
+            ? ` (${audit.displayValue})`
+            : '';
+          response.push(
+            `- ${audit.id}${categories}: ${audit.title}${displayValue} (score: ${audit.score})`,
+          );
+          if (audit.description) {
+            response.push(`  ${collapseWhitespace(audit.description)}`);
+          }
+          if (audit.totalNodes) {
+            const shown =
+              audit.totalNodes > audit.nodes.length
+                ? `, showing ${audit.nodes.length}`
+                : '';
+            response.push(`  Nodes (${audit.totalNodes}${shown}):`);
+          }
+          for (const node of audit.nodes) {
+            // Values are JSON-encoded so that quotes or spaces within them
+            // cannot be confused with the `key=value` delimiters.
+            const parts: string[] = [];
+            if (node.selector) {
+              parts.push(`selector=${JSON.stringify(node.selector)}`);
+            }
+            if (node.nodeLabel) {
+              parts.push(
+                `label=${JSON.stringify(collapseWhitespace(node.nodeLabel))}`,
+              );
+            }
+            if (node.snippet) {
+              parts.push(
+                `snippet=${JSON.stringify(collapseWhitespace(node.snippet))}`,
+              );
+            }
+            response.push(`  - ${parts.join(' ')}`);
+            if (node.explanation) {
+              response.push(`    ${collapseWhitespace(node.explanation)}`);
+            }
+          }
+        }
+      }
       response.push('### Reports');
       for (const report of reports) {
         response.push(`- ${report}`);
@@ -1733,6 +1812,23 @@ function truncateTitle(title: string, maxLength = 50): string {
   return title.slice(0, maxLength - 3) + '...';
 }
 
+const collapseWhitespace = (value: string): string => {
+  return value.replace(/\s+/g, ' ').trim();
+};
+
+function formatPage(
+  mcpPage: McpPage,
+  context: McpContext,
+  targetInfo: Protocol.Target.TargetInfo | undefined,
+): {text: string; structured: ReturnType<typeof createStructuredPage>} {
+  const title = mcpPage.getTitle(targetInfo);
+  const url = mcpPage.url();
+  const pageLabel = title ? `${truncateTitle(title)} (${url})` : url;
+  return {
+    text: `${mcpPage.id}: ${pageLabel}`,
+    structured: createStructuredPage(mcpPage, context, title),
+  };
+}
 function createStructuredPage(
   mcpPage: McpPage,
   context: McpContext,

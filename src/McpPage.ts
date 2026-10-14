@@ -118,6 +118,19 @@ function isDebuggingWebMcpTool(tool: WebMCPTool): boolean {
 const DEFAULT_TIMEOUT = 5_000;
 const NAVIGATION_TIMEOUT = 10_000;
 
+/**
+ * Chrome reports a URL-derived placeholder as the target title until the
+ * document provides one. The placeholder omits the `http://` / `https://`
+ * scheme and the trailing slash of a bare hostname.
+ */
+function isPlaceholderTitle(title: string, url: string): boolean {
+  if (title === url) {
+    return true;
+  }
+  const withoutScheme = url.replace(/^https?:\/\//, '');
+  return title === withoutScheme || title === withoutScheme.replace(/\/$/, '');
+}
+
 function isBackendNodeId(
   id: unknown,
 ): id is DevTools.Protocol.DOM.BackendNodeId {
@@ -229,13 +242,29 @@ export class McpPage implements ContextPage {
   }
 
   url(): string {
-    return this.#pptrPage ? this.#pptrPage.url() : this.target.url();
+    return this.#pptrPage?.url() ?? this.target.url();
   }
 
-  getTitle(): string {
+  get targetId(): string {
     // @ts-expect-error internal types
-    const info = this.target._getTargetInfo();
-    return info.title !== this.target.url() ? info.title : '';
+    const info: Protocol.Target.TargetInfo = this.target._getTargetInfo();
+    return info.targetId;
+  }
+
+  /**
+   * Returns the page title or an empty string if the target only has Chrome's
+   * URL-based placeholder title.
+   *
+   * Puppeteer's cached target info is only refreshed by
+   * `Target.targetInfoChanged`, which Chrome emits on navigation commit (before
+   * the document title is known) but not on title changes. Callers should pass
+   * fresh target info (e.g., from `Target.getTargets`) when available.
+   */
+  getTitle(freshTargetInfo?: Protocol.Target.TargetInfo): string {
+    // @ts-expect-error internal types
+    const cachedInfo: Protocol.Target.TargetInfo = this.target._getTargetInfo();
+    const info = freshTargetInfo ?? cachedInfo;
+    return isPlaceholderTitle(info.title, info.url) ? '' : info.title;
   }
 
   isClosed(): boolean {
@@ -355,10 +384,7 @@ export class McpPage implements ContextPage {
   }
 
   #getDebuggingWebMcpToolGroups(): ToolGroups {
-    if (!this.#pptrPage) {
-      return [];
-    }
-    const webmcpTools = this.#pptrPage.webmcp
+    const webmcpTools = this.pptrPage.webmcp
       .tools()
       .filter(isDebuggingWebMcpTool);
     if (webmcpTools.length === 0) {
@@ -662,9 +688,13 @@ export class McpPage implements ContextPage {
       .tools()
       .find(t => t.name === toolName && isDebuggingWebMcpTool(t));
     if (webmcpTool) {
-      const {status, output, errorText} = await webmcpTool.execute(params);
+      const {status, output, errorText, exception} =
+        await webmcpTool.execute(params);
       if (status !== 'Completed') {
-        throw new Error(errorText || `Tool execution failed: ${status}`);
+        const error = exception?.description ?? exception?.value ?? errorText;
+        throw new Error(
+          error ? String(error) : `Tool execution failed: ${status}`,
+        );
       }
       if (output !== undefined) {
         response.appendResponseLine(JSON.stringify(output, null, 2));
@@ -1231,14 +1261,14 @@ export class McpPage implements ContextPage {
     // For waiters 5sec timeout should be sufficient.
     // Increased in case we throttle the CPU
     const cpuMultiplier = this.cpuThrottlingRate;
-    this.#pptrPage.setDefaultTimeout(DEFAULT_TIMEOUT * cpuMultiplier);
+    this.pptrPage.setDefaultTimeout(DEFAULT_TIMEOUT * cpuMultiplier);
     // 10sec should be enough for the load event to be emitted during
     // navigations.
     // Increased in case we throttle the network requests or the CPU
     const networkMultiplier = getNetworkMultiplierFromString(
       this.networkConditions,
     );
-    this.#pptrPage.setDefaultNavigationTimeout(
+    this.pptrPage.setDefaultNavigationTimeout(
       this.#navigationTimeout * networkMultiplier * cpuMultiplier,
     );
   }
