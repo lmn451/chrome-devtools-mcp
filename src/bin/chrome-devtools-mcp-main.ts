@@ -10,12 +10,13 @@ import process from 'node:process';
 
 import {BrowserManager} from '../BrowserManager.js';
 import {startMcpHttpServer, type McpHttpServer} from '../http-server.js';
-import {McpServer, logDisclaimers} from '../index.js';
+import {McpServer} from '../index.js';
 import {runStdioProxy} from '../proxy.js';
 import {ClearcutLogger} from '../telemetry/ClearcutLogger.js';
 import {computeFlagUsage} from '../telemetry/flagUtils.js';
 import {StdioServerTransport} from '../third_party/index.js';
 import {checkForUpdates} from '../utils/check-for-updates.js';
+import {logDisclaimers} from '../utils/disclaimers.js';
 import {logger, saveLogsToFile} from '../utils/logger.js';
 import {setupUnhandledRejectionHandler} from '../utils/errorHandling.js';
 import {VERSION} from '../version.js';

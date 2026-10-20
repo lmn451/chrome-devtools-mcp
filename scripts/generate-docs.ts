@@ -5,6 +5,7 @@
  */
 
 import fs from 'node:fs';
+import prettier from 'prettier';
 
 import type {Options as YargsOptions} from 'yargs';
 
@@ -17,10 +18,7 @@ import type {ParsedArguments} from '../build/src/config/ConfigParser.js';
 import {zod} from '../build/src/third_party/index.js';
 import {ToolCategory, labels} from '../build/src/tools/categories.js';
 import {isSlimTool} from '../build/src/tools/ToolDefinition.js';
-import type {
-  DefinedPageTool,
-  ToolDefinition,
-} from '../src/tools/ToolDefinition.js';
+import type {AnyToolDefinition} from '../src/tools/ToolDefinition.js';
 import {createTools, requiresHiddenFlag} from '../build/src/tools/tools.js';
 
 const OUTPUT_PATH = './docs/tool-reference.md';
@@ -326,17 +324,19 @@ async function generateReference(
     }
   }
 
-  // Write the documentation to file
-  fs.writeFileSync(outputPath, markdown.trim() + '\n');
+  const prettierOptions = (await prettier.resolveConfig(outputPath)) ?? {};
+  const formattedMarkdown = await prettier.format(markdown.trim() + '\n', {
+    ...prettierOptions,
+    filepath: outputPath,
+  });
+  fs.writeFileSync(outputPath, formattedMarkdown);
 
   console.log(
     `Generated documentation for ${toolsWithAnnotations.length} tools in ${outputPath}`,
   );
 }
 
-function getToolsAndCategories(
-  tools: Array<ToolDefinition<zod.ZodRawShape> | DefinedPageTool>,
-) {
+function getToolsAndCategories(tools: AnyToolDefinition[]) {
   // Convert ToolDefinitions to ToolWithAnnotations
   const toolsWithAnnotations: ToolWithAnnotations[] = tools
     .filter(tool => {
@@ -412,7 +412,10 @@ async function generateToolDocumentation(): Promise<void> {
   try {
     console.log('Generating tool documentation from definitions...');
     // Returns both the regular and the slim tools.
-    const tools = createTools({pageIdRouting: true} as ParsedArguments);
+    const tools = createTools({
+      pageIdRouting: true,
+      categoryExtensions: true,
+    } as ParsedArguments);
 
     {
       const {toolsWithAnnotations, categories, sortedCategories} =

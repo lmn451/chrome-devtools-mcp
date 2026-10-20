@@ -11,11 +11,12 @@ import sinon from 'sinon';
 
 import type {TargetUniverse} from '../src/devtools/DevtoolsUtils.js';
 import {McpPage, replaceHtmlElementsWithUids} from '../src/McpPage.js';
-import {DevTools, Locator} from '../src/third_party/index.js';
+import {DevTools, Locator, ScreenRecorder} from '../src/third_party/index.js';
 import type {JSONSchema7Definition} from '../src/third_party/index.js';
 import {TextSnapshot} from '../src/TextSnapshot.js';
 import type {TextSnapshotNode} from '../src/types.js';
 import {
+  createMockCDPSession,
   createMockMcpResponse,
   createMockPuppeteerPage,
   createMockPuppeteerTarget,
@@ -327,8 +328,8 @@ describe('McpPage', () => {
       sinon.assert.notCalled(target.page);
       sinon.assert.notCalled(target.asPage);
       assert.throws(() => mcpPage.pptrPage, /not initialized/);
-      assert.throws(
-        () => mcpPage.getThirdPartyDeveloperTools(),
+      await assert.rejects(
+        () => mcpPage.discoverThirdPartyDeveloperTools(),
         /not initialized/,
       );
       assert.throws(() => mcpPage.getWebMcpTools(), /not initialized/);
@@ -341,6 +342,43 @@ describe('McpPage', () => {
       assert.strictEqual(mcpPage.pptrPage, pptrPage);
       assert.strictEqual(mcpPage.getTitle(), 'Target Title');
       sinon.assert.notCalled(pptrPage.title);
+    });
+
+    it('detaches a DevTools session created after page disposal', async () => {
+      const pptrPage = createMockPuppeteerPage();
+      pptrPage.emulateFocusedPage.resolves();
+      const target = createMockPuppeteerTarget({page: pptrPage});
+      const mcpPage = new McpPage(target, 1, {
+        hasNetworkBlockOrAllowlist: false,
+        locatorClass: Locator,
+      });
+      const pendingSession =
+        Promise.withResolvers<
+          Awaited<ReturnType<typeof pptrPage.createCDPSession>>
+        >();
+      pptrPage.createCDPSession.returns(pendingSession.promise);
+
+      const initializing = mcpPage.init();
+      await new Promise(resolve => setImmediate(resolve));
+      sinon.assert.calledOnce(pptrPage.createCDPSession);
+
+      const disposing = mcpPage.disposeAsync();
+      let disposed = false;
+      void disposing.then(() => {
+        disposed = true;
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.ok(
+        !disposed,
+        'disposal should await in-flight page initialization',
+      );
+
+      const session = createMockCDPSession();
+      pendingSession.resolve(session);
+      await Promise.all([initializing, disposing]);
+
+      sinon.assert.calledOnce(session.detach);
+      assert.strictEqual(mcpPage.devtoolsUniverse, undefined);
     });
 
     it('falls back to target.asPage() when target.page() returns null', async () => {
@@ -393,6 +431,22 @@ describe('McpPage', () => {
         runBeforeUnload: false,
       });
       sinon.assert.notCalled(pptrPage.emulateFocusedPage);
+    });
+
+    it('stops and clears an active screenRecorder on dispose()', async () => {
+      const target = createMockPuppeteerTarget();
+      const mcpPage = new McpPage(target, 1, {
+        hasNetworkBlockOrAllowlist: false,
+        locatorClass: Locator,
+      });
+      const recorder = sinon.createStubInstance(ScreenRecorder);
+      recorder.stop.resolves();
+      mcpPage.setScreenRecorder({recorder, filePath: '/tmp/video.mp4'});
+
+      mcpPage.dispose();
+
+      sinon.assert.calledOnceWithExactly(recorder.stop);
+      assert.strictEqual(mcpPage.getScreenRecorder(), null);
     });
   });
 
@@ -712,6 +766,43 @@ describe('McpPage', () => {
       sinon.assert.calledWithExactly(pptrPage.setViewport.secondCall, null);
     });
 
+    it('does not store a viewport that setViewport rejects', async () => {
+      const {mcpPage, pptrPage} = await createMcpPage();
+      pptrPage.setViewport.rejects(new Error('Invalid parameters'));
+
+      await assert.rejects(
+        () => mcpPage.emulate({viewport: {width: 800.5, height: 600}}),
+        /Invalid parameters/,
+      );
+
+      assert.strictEqual(mcpPage.viewport, null);
+    });
+
+    it('keeps the previous viewport when setViewport rejects a new one', async () => {
+      const {mcpPage, pptrPage} = await createMcpPage();
+      await mcpPage.emulate({viewport: {width: 400, height: 400}});
+      pptrPage.setViewport.rejects(new Error('Invalid parameters'));
+
+      await assert.rejects(
+        () =>
+          mcpPage.emulate({
+            viewport: {width: 20000000, height: 600},
+            cpuThrottlingRate: 4,
+          }),
+        /Invalid parameters/,
+      );
+
+      assert.deepStrictEqual(mcpPage.viewport, {
+        width: 400,
+        height: 400,
+        deviceScaleFactor: 1,
+        isMobile: false,
+        hasTouch: false,
+        isLandscape: false,
+      });
+      assert.strictEqual(mcpPage.cpuThrottlingRate, 4);
+    });
+
     it('calls setExtraHTTPHeaders with the given headers', async () => {
       const {mcpPage, pptrPage} = await createMcpPage();
       await mcpPage.emulate({
@@ -761,8 +852,18 @@ describe('McpPage', () => {
 
       await mcpPage.restoreEmulation();
 
-      sinon.assert.calledTwice(pptrPage.setViewport);
+      // A different width first, because Chrome ignores an override that is
+      // identical to the last one of this session (see restoreEmulation).
+      sinon.assert.calledThrice(pptrPage.setViewport);
       sinon.assert.calledWithExactly(pptrPage.setViewport.secondCall, {
+        width: 399,
+        height: 400,
+        deviceScaleFactor: 1,
+        isMobile: false,
+        hasTouch: false,
+        isLandscape: false,
+      });
+      sinon.assert.calledWithExactly(pptrPage.setViewport.thirdCall, {
         width: 400,
         height: 400,
         deviceScaleFactor: 1,
@@ -770,6 +871,16 @@ describe('McpPage', () => {
         hasTouch: false,
         isLandscape: false,
       });
+    });
+
+    it('does not send a scratch viewport when none was configured', async () => {
+      const {mcpPage, pptrPage} = await createMcpPage();
+      await mcpPage.emulate({cpuThrottlingRate: 4});
+      pptrPage.setViewport.resetHistory();
+
+      await mcpPage.restoreEmulation();
+
+      sinon.assert.calledOnceWithExactly(pptrPage.setViewport, null);
     });
 
     it('re-applies previously configured network and cpu throttling emulation', async () => {
@@ -1403,7 +1514,7 @@ describe('McpPage', () => {
       sinon.restore();
     });
 
-    it('filters WebMCP tools by annotations.debugging in getToolGroups()', async () => {
+    it('filters WebMCP tools by annotations.debugging in discoverThirdPartyDeveloperTools()', async () => {
       const {mcpPage, pptrPage} = await createMcpPage();
 
       const debuggingTool = createMockWebMCPTool({
@@ -1429,7 +1540,7 @@ describe('McpPage', () => {
         unannotatedTool,
       ]);
 
-      const groups = await mcpPage.getToolGroups();
+      const groups = await mcpPage.discoverThirdPartyDeveloperTools();
       assert.deepStrictEqual(groups, [
         {
           name: 'WebMCP Tools',
@@ -1443,10 +1554,9 @@ describe('McpPage', () => {
           ],
         },
       ]);
-      assert.deepStrictEqual(mcpPage.getThirdPartyDeveloperTools(), groups);
     });
 
-    it('combines WebMCP debugging tools and devtoolstooldiscovery tools in getThirdPartyDeveloperTools()', async () => {
+    it('combines WebMCP debugging tools and devtoolstooldiscovery tools in discoverThirdPartyDeveloperTools()', async () => {
       const {mcpPage, pptrPage} = await createMcpPage();
 
       const debuggingTool = createMockWebMCPTool({
@@ -1455,7 +1565,10 @@ describe('McpPage', () => {
         annotations: {debugging: true},
       });
       pptrPage.webmcp.tools.returns([debuggingTool]);
-      mcpPage.eventBasedThirdPartyTools = [
+      pptrPage.cdpSession.send.resolves({
+        listeners: [{type: 'devtoolstooldiscovery'}],
+      });
+      pptrPage.evaluate.resolves([
         {
           name: 'Custom Tools',
           description: 'Tools exposed via event',
@@ -1467,17 +1580,16 @@ describe('McpPage', () => {
                 type: 'object',
                 properties: {
                   el: {
-                    properties: {uid: {type: 'string'}},
-                    required: ['uid'],
+                    'x-mcp-type': 'HTMLElement',
                   },
                 },
               },
             },
           ],
         },
-      ];
+      ]);
 
-      const groups = mcpPage.getThirdPartyDeveloperTools();
+      const groups = await mcpPage.discoverThirdPartyDeveloperTools();
       assert.deepStrictEqual(groups, [
         {
           name: 'WebMCP Tools',
@@ -1501,6 +1613,7 @@ describe('McpPage', () => {
                 type: 'object',
                 properties: {
                   el: {
+                    'x-mcp-type': 'HTMLElement',
                     properties: {uid: {type: 'string'}},
                     required: ['uid'],
                   },
@@ -1512,10 +1625,13 @@ describe('McpPage', () => {
       ]);
     });
 
-    it('reflects dynamically added and removed WebMCP debugging tools in getThirdPartyDeveloperTools()', async () => {
+    it('reflects dynamically added and removed WebMCP debugging tools in discoverThirdPartyDeveloperTools()', async () => {
       const {mcpPage, pptrPage} = await createMcpPage();
 
-      assert.deepStrictEqual(mcpPage.getThirdPartyDeveloperTools(), []);
+      assert.deepStrictEqual(
+        await mcpPage.discoverThirdPartyDeveloperTools(),
+        [],
+      );
 
       const debuggingTool = createMockWebMCPTool({
         name: 'dynamic_debug_tool',
@@ -1525,7 +1641,7 @@ describe('McpPage', () => {
       });
       pptrPage.webmcp.tools.returns([debuggingTool]);
 
-      assert.deepStrictEqual(mcpPage.getThirdPartyDeveloperTools(), [
+      assert.deepStrictEqual(await mcpPage.discoverThirdPartyDeveloperTools(), [
         {
           name: 'WebMCP Tools',
           description: 'Tools exposed via WebMCP',
@@ -1540,7 +1656,10 @@ describe('McpPage', () => {
       ]);
 
       pptrPage.webmcp.tools.returns([]);
-      assert.deepStrictEqual(mcpPage.getThirdPartyDeveloperTools(), []);
+      assert.deepStrictEqual(
+        await mcpPage.discoverThirdPartyDeveloperTools(),
+        [],
+      );
     });
 
     it('executes a WebMCP tool in executeThirdPartyDeveloperTool()', async () => {

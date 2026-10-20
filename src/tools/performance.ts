@@ -136,6 +136,7 @@ export const startTrace = definePageTool(() => ({
           // Tracing may not have started yet; ignore.
         }
         context.setIsRunningPerformanceTrace(false);
+        context.setPerformanceTracePage(undefined);
       }
       throw error;
     }
@@ -159,6 +160,9 @@ export const stopTrace = definePageTool(() => ({
   },
   handler: async (request, response, context) => {
     if (!context.isRunningPerformanceTrace()) {
+      response.appendResponseLine(
+        'Error: no active performance trace recording to stop.',
+      );
       return;
     }
     const page = context.getPerformanceTracePage() ?? request.page;
@@ -258,6 +262,7 @@ async function stopTracingAndAppendOutput(
     }
   } finally {
     context.setIsRunningPerformanceTrace(false);
+    context.setPerformanceTracePage(undefined);
   }
 }
 

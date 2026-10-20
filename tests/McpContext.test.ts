@@ -5,7 +5,6 @@
  */
 
 import assert from 'node:assert';
-import {EventEmitter} from 'node:events';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -15,17 +14,33 @@ import {pathToFileURL} from 'node:url';
 import {Locator} from 'puppeteer';
 import sinon from 'sinon';
 
+import {UncaughtError} from '../src/collectors/PageCollector.js';
+import {ServiceWorkerConsoleCollector} from '../src/collectors/ServiceWorkerCollector.js';
 import {NetworkFormatter} from '../src/formatters/NetworkFormatter.js';
 import {McpContext} from '../src/McpContext.js';
 import {McpPage} from '../src/McpPage.js';
+import {HeapSnapshotManager} from '../src/processors/HeapSnapshotManager.js';
 import {TextSnapshot} from '../src/TextSnapshot.js';
-import {type HTTPResponse} from '../src/third_party/index.js';
+import {
+  type Browser,
+  type HTTPResponse,
+  type Target,
+  TargetType,
+} from '../src/third_party/index.js';
 import type {TraceResult} from '../src/processors/PerformanceTrace.js';
 import {resolveCanonicalPath} from '../src/utils/files.js';
+import {stableIdSymbol} from '../src/utils/id.js';
 
+import {
+  createMockMcpWorker,
+  createMockPuppeteerBrowser,
+  createMockPuppeteerPage,
+  createMockPuppeteerTarget,
+} from './mocks.js';
 import {serverHooks, TestServer} from './server.js';
 import {
   assertNoServiceWorkerReported,
+  createConnectedMcpContext,
   createTempDir,
   createTempFile,
   getMockBrowser,
@@ -50,43 +65,114 @@ describe('McpContext', () => {
     sinon.restore();
   });
 
-  it('detaches target handlers before stopping an active recorder', async () => {
-    const browserEvents = new EventEmitter();
-    const browser = Object.assign(browserEvents, {
-      targets: () => [],
-    }) as unknown as Parameters<typeof McpContext.from>[0];
-    const context = await McpContext.from(
+  function createPageTarget() {
+    const page = createMockPuppeteerPage();
+    page.emulateFocusedPage.resolves();
+    const target = createMockPuppeteerTarget({page});
+    target.type.returns(TargetType.PAGE);
+    return {page, target};
+  }
+
+  async function createMockContext(options?: {
+    browser?: sinon.SinonStubbedInstance<Browser>;
+    targets?: Target[];
+  }) {
+    const browser = options?.browser ?? createMockPuppeteerBrowser();
+    const {target: defaultTarget} = createPageTarget();
+    browser.targets.returns(options?.targets ?? [defaultTarget]);
+    browser.browserContexts.returns([]);
+    return await createConnectedMcpContext(
       browser,
-      undefined,
       {
         experimentalDevToolsDebugging: false,
-        performanceCrux: false,
+        performanceCrux: true,
+        heapSnapshotManager: new HeapSnapshotManager(),
       },
       Locator,
     );
+  }
 
-    let listenerCountsDuringStop: [number, number] | undefined;
-    const recorder = {
-      stop: async (): Promise<void> => {
-        listenerCountsDuringStop = [
-          browserEvents.listenerCount('targetcreated'),
-          browserEvents.listenerCount('targetdestroyed'),
-        ];
-      },
-    } as unknown as NonNullable<
-      Parameters<typeof context.setScreenRecorder>[0]
-    >['recorder'];
-    context.setScreenRecorder({recorder, filePath: 'unused.webm'});
+  describe('getServiceWorkerConsoleData', () => {
+    it('resolves the service worker ID to the collector extension ID', async () => {
+      const browser = createMockPuppeteerBrowser();
+      browser.targets.returns([]);
+      const context = await createConnectedMcpContext(
+        browser,
+        {
+          experimentalDevToolsDebugging: false,
+          performanceCrux: false,
+          heapSnapshotManager: new HeapSnapshotManager(),
+        },
+        Locator,
+      );
+      const worker = createMockMcpWorker({
+        id: 'sw-3',
+        url: 'chrome-extension://extension-id/background.js',
+      });
+      const getWorkerById = sinon
+        .stub(context, 'getWorkerById')
+        .returns(worker);
+      const messages = [
+        Object.assign(
+          new UncaughtError(
+            {
+              exceptionId: 1,
+              text: 'Service worker error',
+              lineNumber: 0,
+              columnNumber: 0,
+            },
+            'extension-id',
+          ),
+          {[stableIdSymbol]: 1},
+        ),
+      ];
+      const getData = sinon
+        .stub(ServiceWorkerConsoleCollector.prototype, 'getData')
+        .returns(messages);
 
-    await context.dispose();
+      const result = context.getServiceWorkerConsoleData('sw-3');
 
-    assert.deepEqual(
-      listenerCountsDuringStop,
-      [0, 0],
-      'all target handlers should be removed before awaiting recorder shutdown',
-    );
-    assert.strictEqual(browserEvents.listenerCount('targetcreated'), 0);
-    assert.strictEqual(browserEvents.listenerCount('targetdestroyed'), 0);
+      sinon.assert.calledOnceWithExactly(getWorkerById, 'sw-3');
+      sinon.assert.calledOnceWithExactly(getData, 'extension-id');
+      assert.strictEqual(result, messages);
+      await context.dispose();
+    });
+
+    for (const serviceWorkerId of ['sw-404', 'extension-id', 'dw-1', 'shw-2']) {
+      it(`rejects ${serviceWorkerId} without reading console data`, async () => {
+        const browser = createMockPuppeteerBrowser();
+        browser.targets.returns([]);
+        const context = await createConnectedMcpContext(
+          browser,
+          {
+            experimentalDevToolsDebugging: false,
+            performanceCrux: false,
+            heapSnapshotManager: new HeapSnapshotManager(),
+          },
+          Locator,
+        );
+        const getWorkerById = sinon.stub(context, 'getWorkerById');
+        getWorkerById
+          .withArgs('dw-1')
+          .returns(createMockMcpWorker({id: 'dw-1', type: 'dedicated_worker'}));
+        getWorkerById
+          .withArgs('shw-2')
+          .returns(createMockMcpWorker({id: 'shw-2', type: 'shared_worker'}));
+        const getData = sinon.stub(
+          ServiceWorkerConsoleCollector.prototype,
+          'getData',
+        );
+
+        assert.throws(
+          () => context.getServiceWorkerConsoleData(serviceWorkerId),
+          /Service worker not found\./,
+        );
+
+        sinon.assert.calledOnceWithExactly(getWorkerById, serviceWorkerId);
+        sinon.assert.notCalled(getData);
+        await context.dispose();
+      });
+    }
   });
 
   it('list pages', async () => {
@@ -336,6 +422,212 @@ describe('McpContext', () => {
     });
   });
 
+  it('preserves an unread fallback across snapshots until read', async () => {
+    const browser = createMockPuppeteerBrowser();
+    const {target: firstTarget} = createPageTarget();
+    const {page: secondPptrPage, target: secondTarget} = createPageTarget();
+    const context = await createMockContext({
+      browser,
+      targets: [firstTarget, secondTarget],
+    });
+    const [, secondPage] = context.getPages();
+    assert.ok(secondPage);
+    context.selectPage(secondPage);
+    await secondPage.init();
+
+    secondPptrPage.isClosed.returns(true);
+    browser.targets.returns([firstTarget]);
+
+    // First snapshot detects the fallback.
+    await context.createPagesSnapshot();
+    // Second snapshot runs before the fallback has been read by the response
+    // formatter.
+    await context.createPagesSnapshot();
+
+    assert.deepStrictEqual(context.getSelectedPageFallback(), {
+      wasClosed: true,
+    });
+
+    await context.createPagesSnapshot();
+    assert.strictEqual(context.getSelectedPageFallback(), undefined);
+  });
+
+  it('overwrites an unread fallback when a second fallback occurs before it is read', async () => {
+    const browser = createMockPuppeteerBrowser();
+    const {page: firstPptrPage, target: firstTarget} = createPageTarget();
+    const {target: secondTarget} = createPageTarget();
+    const {page: thirdPptrPage, target: thirdTarget} = createPageTarget();
+    const context = await createMockContext({
+      browser,
+      targets: [firstTarget, secondTarget, thirdTarget],
+    });
+    const [firstPage, secondPage, thirdPage] = context.getPages();
+    assert.ok(firstPage);
+    assert.ok(secondPage);
+    assert.ok(thirdPage);
+    context.selectPage(thirdPage);
+    await thirdPage.init();
+
+    // First snapshot: thirdPage triggers a fallback to firstPage (recording
+    // wasClosed: false on the third isClosed() call so it is distinguishable
+    // from the second fallback).
+    thirdPptrPage.isClosed
+      .onFirstCall()
+      .returns(true)
+      .onSecondCall()
+      .returns(true)
+      .returns(false);
+    browser.targets.returns([firstTarget, secondTarget]);
+    await context.createPagesSnapshot();
+    assert.ok(context.isPageSelected(firstPage));
+
+    // Second snapshot before getSelectedPageFallback() is read: the newly
+    // selected firstPage also closes and falls back to secondPage.
+    firstPptrPage.isClosed.returns(true);
+    browser.targets.returns([secondTarget]);
+    await context.createPagesSnapshot();
+    assert.ok(context.isPageSelected(secondPage));
+
+    assert.deepStrictEqual(context.getSelectedPageFallback(), {
+      wasClosed: true,
+    });
+
+    await context.createPagesSnapshot();
+    assert.strictEqual(context.getSelectedPageFallback(), undefined);
+  });
+
+  it('clears the fallback when selectPage is called explicitly', async () => {
+    const browser = createMockPuppeteerBrowser();
+    const {target: firstTarget} = createPageTarget();
+    const {page: secondPptrPage, target: secondTarget} = createPageTarget();
+    const context = await createMockContext({
+      browser,
+      targets: [firstTarget, secondTarget],
+    });
+    const [firstPage, secondPage] = context.getPages();
+    assert.ok(firstPage);
+    assert.ok(secondPage);
+    context.selectPage(secondPage);
+    await secondPage.init();
+
+    secondPptrPage.isClosed.returns(true);
+    browser.targets.returns([firstTarget]);
+    await context.createPagesSnapshot();
+
+    context.selectPage(firstPage);
+    assert.strictEqual(context.getSelectedPageFallback(), undefined);
+  });
+
+  it('disposes the selected page only once when context is disposed', async () => {
+    const context = await createMockContext();
+    const page = context.getSelectedMcpPage();
+    const disposeSpy = sinon.spy(page, 'disposeAsync');
+
+    await context.dispose();
+
+    sinon.assert.calledOnceWithExactly(disposeSpy);
+  });
+
+  it('detaches target handlers before awaiting page recorder shutdown', async () => {
+    const browser = createMockPuppeteerBrowser();
+    const {target} = createPageTarget();
+    const context = await createMockContext({browser, targets: [target]});
+    const page = context.getSelectedMcpPage();
+
+    let signalStopStarted!: () => void;
+    const stopStarted = new Promise<void>(resolve => {
+      signalStopStarted = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopCompletion = new Promise<void>(resolve => {
+      releaseStop = resolve;
+    });
+    const offCallCountBeforeDispose = browser.off.callCount;
+    let offEventsDuringStop: Array<string | symbol | number> = [];
+    page.setScreenRecorder({
+      recorder: {
+        stop: () => {
+          offEventsDuringStop = browser.off
+            .getCalls()
+            .slice(offCallCountBeforeDispose)
+            .map(call => call.args[0]);
+          signalStopStarted();
+          return stopCompletion;
+        },
+      },
+      filePath: 'unused.webm',
+    } as NonNullable<Parameters<typeof page.setScreenRecorder>[0]>);
+
+    const disposing = context.dispose();
+    try {
+      await stopStarted;
+      assert.deepEqual(
+        new Set(offEventsDuringStop),
+        new Set(['targetcreated', 'targetdestroyed']),
+      );
+    } finally {
+      releaseStop();
+      await disposing;
+    }
+  });
+
+  it('awaits cleanup for a page removed by targetdestroyed', async () => {
+    const browser = createMockPuppeteerBrowser();
+    const first = createPageTarget();
+    const destroyed = createPageTarget();
+    const context = await createMockContext({
+      browser,
+      targets: [first.target, destroyed.target],
+    });
+    const destroyedPage = context
+      .getPages()
+      .find(page => page.target === destroyed.target);
+    assert.ok(destroyedPage);
+
+    const cleanup = Promise.withResolvers<void>();
+    const disposeAsync = sinon
+      .stub(destroyedPage, 'disposeAsync')
+      .returns(cleanup.promise);
+    browser.emit('targetdestroyed', destroyed.target);
+    sinon.assert.calledOnce(disposeAsync);
+
+    let disposed = false;
+    const disposing = context.dispose().then(() => {
+      disposed = true;
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(
+      !disposed,
+      'context disposal should await destroyed-page cleanup',
+    );
+
+    cleanup.resolve();
+    await disposing;
+    assert.ok(disposed);
+  });
+
+  it('disposes a selected page that closed after being pruned from the snapshot', async () => {
+    const browser = createMockPuppeteerBrowser();
+    const {page: pptrPage, target} = createPageTarget();
+    const context = await createMockContext({
+      browser,
+      targets: [target],
+    });
+    const page = context.getSelectedMcpPage();
+    const disposeSpy = sinon.spy(page, 'disposeAsync');
+
+    // Prune the target from #mcpPages while the selected page is still open.
+    browser.targets.returns([]);
+    await context.createPagesSnapshot();
+    sinon.assert.notCalled(disposeSpy);
+
+    // The selected page closes before another snapshot runs.
+    pptrPage.isClosed.returns(true);
+    await context.dispose();
+
+    sinon.assert.calledOnceWithExactly(disposeSpy);
+  });
+
   it('does not report a fallback for a regular selection', async () => {
     await withMcpContext(async (_response, context) => {
       await context.newPage();
@@ -395,20 +687,16 @@ describe('McpContext', () => {
       const options = {
         experimentalDevToolsDebugging: false,
         performanceCrux: false,
+        heapSnapshotManager: new HeapSnapshotManager(),
       };
-      const first = await McpContext.from(browser, undefined, options, Locator);
+      const first = await createConnectedMcpContext(browser, options, Locator);
       const idBeforeReconnect = (await first.newPage()).id;
-      first.dispose();
+      await first.dispose();
 
       // A new context (as created after a browser reconnect) continues the
       // shared id counter, so an id handed out before no longer resolves and
       // the next page keeps counting up rather than colliding with it.
-      const second = await McpContext.from(
-        browser,
-        undefined,
-        options,
-        Locator,
-      );
+      const second = await createConnectedMcpContext(browser, options, Locator);
       try {
         assert.throws(
           () => second.getPageById(idBeforeReconnect),
@@ -419,7 +707,8 @@ describe('McpContext', () => {
           'ids continue past the pre-reconnect ids',
         );
       } finally {
-        second.dispose();
+        await second.dispose();
+        options.heapSnapshotManager.dispose();
       }
     });
   });
@@ -436,42 +725,227 @@ describe('McpContext', () => {
     });
   });
 
-  it('reports the reconnect notice once', async () => {
-    await withBrowser(async browser => {
-      const context = await McpContext.from(
-        browser,
+  describe('lazy browser connection', () => {
+    function createLazyContext(getBrowser: () => Promise<Browser>) {
+      return McpContext.create(
         undefined,
         {
           experimentalDevToolsDebugging: false,
           performanceCrux: false,
-          reconnected: true,
+          heapSnapshotManager: new HeapSnapshotManager(),
+          getBrowser,
         },
         Locator,
       );
-      try {
-        assert.ok(context.consumeReconnectNotice(), 'notice available once');
-        assert.ok(!context.consumeReconnectNotice(), 'notice does not repeat');
-      } finally {
-        context.dispose();
-      }
+    }
+
+    function createBrowser() {
+      const browser = createMockPuppeteerBrowser();
+      browser.targets.returns([]);
+      return browser;
+    }
+
+    it('does not connect until ensureBrowser() is called', async () => {
+      const browser = createBrowser();
+      const getBrowser = sinon.stub<[], Promise<Browser>>().resolves(browser);
+      const context = createLazyContext(getBrowser);
+
+      sinon.assert.notCalled(getBrowser);
+      assert.throws(() => context.browser, /Not connected to a browser/);
+
+      assert.strictEqual(await context.ensureBrowser(), browser);
+      assert.strictEqual(context.browser, browser);
+      sinon.assert.calledOnce(getBrowser);
+      await context.dispose();
     });
-  });
 
-  it('disposes loaded heap snapshots on teardown', async () => {
-    await withMcpContext(async (_response, context) => {
-      const filePath = path.join(
-        process.cwd(),
-        'tests/fixtures/example.heapsnapshot',
+    it('does not install a browser returned after context disposal', async () => {
+      const browser = createBrowser();
+      const pendingBrowser = Promise.withResolvers<Browser>();
+      const getBrowser = sinon
+        .stub<[], Promise<Browser>>()
+        .returns(pendingBrowser.promise);
+      const context = createLazyContext(getBrowser);
+
+      const connecting = context.ensureBrowser();
+      sinon.assert.calledOnce(getBrowser);
+
+      await context.dispose();
+      pendingBrowser.resolve(browser);
+
+      await assert.rejects(connecting, /Browser was replaced/);
+      sinon.assert.notCalled(browser.on);
+      assert.throws(() => context.browser, /Not connected to a browser/);
+    });
+
+    it('resets the browser state and reports a reconnect notice once when the browser changes', async () => {
+      const firstBrowser = createBrowser();
+      const secondBrowser = createBrowser();
+      const getBrowser = sinon.stub<[], Promise<Browser>>();
+      getBrowser.onFirstCall().resolves(firstBrowser);
+      getBrowser.onSecondCall().resolves(secondBrowser);
+      const context = createLazyContext(getBrowser);
+
+      await context.ensureBrowser();
+      assert.ok(!context.consumeReconnectNotice());
+      context.setIsRunningPerformanceTrace(true);
+
+      await context.ensureBrowser();
+
+      assert.strictEqual(context.browser, secondBrowser);
+      assert.ok(!context.isRunningPerformanceTrace());
+      sinon.assert.calledWith(
+        firstBrowser.off,
+        'targetcreated',
+        sinon.match.func,
       );
-      await context.getHeapSnapshotStats(filePath);
-      assert.ok(context.hasHeapSnapshots(), 'snapshot loaded before teardown');
+      assert.ok(context.consumeReconnectNotice(), 'notice available once');
+      assert.ok(!context.consumeReconnectNotice(), 'notice does not repeat');
+      await context.dispose();
+    });
 
-      context.dispose();
+    it('starts over if initializing the browser state fails', async () => {
+      const browser = createBrowser();
+      browser.targets.onFirstCall().throws(new Error('init failed'));
+      const context = createLazyContext(async () => browser);
 
-      assert.ok(
-        !context.hasHeapSnapshots(),
-        'heap snapshots freed on teardown',
-      );
+      await assert.rejects(context.ensureBrowser(), /init failed/);
+      assert.throws(() => context.browser, /Not connected to a browser/);
+
+      await context.ensureBrowser();
+      assert.strictEqual(context.browser, browser);
+      assert.ok(!context.consumeReconnectNotice());
+      await context.dispose();
+    });
+
+    describe('when the browser is replaced during a hanging initialization', () => {
+      function setUpHangingInit() {
+        const firstBrowser = createBrowser();
+        const secondBrowser = createBrowser();
+        const getBrowser = sinon.stub<[], Promise<Browser>>();
+        getBrowser.onFirstCall().resolves(firstBrowser);
+        getBrowser.onSecondCall().resolves(secondBrowser);
+        const context = createLazyContext(getBrowser);
+        const hangingSnapshot = Promise.withResolvers<McpPage[]>();
+        sinon
+          .stub(context, 'createPagesSnapshot')
+          .callThrough()
+          .onFirstCall()
+          .returns(hangingSnapshot.promise);
+        return {context, firstBrowser, secondBrowser, hangingSnapshot};
+      }
+
+      it('does not touch the new browser state once the stale call resumes', async () => {
+        const {context, firstBrowser, secondBrowser, hangingSnapshot} =
+          setUpHangingInit();
+
+        const staleCall = context.ensureBrowser();
+        await context.ensureBrowser();
+        for (const call of firstBrowser.on.getCalls()) {
+          sinon.assert.calledWithExactly(firstBrowser.off, ...call.args);
+        }
+        const firstBrowserOnCalls = firstBrowser.on.callCount;
+        const secondBrowserOnCalls = secondBrowser.on.callCount;
+
+        hangingSnapshot.resolve([]);
+        await assert.rejects(staleCall, /Browser was replaced/);
+
+        assert.strictEqual(context.browser, secondBrowser);
+        sinon.assert.callCount(firstBrowser.on, firstBrowserOnCalls);
+        sinon.assert.callCount(secondBrowser.on, secondBrowserOnCalls);
+        assert.ok(!context.consumeReconnectNotice());
+        await context.dispose();
+      });
+
+      it('does not reset the new browser state when the stale call fails', async () => {
+        const {context, secondBrowser, hangingSnapshot} = setUpHangingInit();
+
+        const staleCall = context.ensureBrowser();
+        await context.ensureBrowser();
+
+        hangingSnapshot.reject(new Error('init failed'));
+        await assert.rejects(staleCall, /init failed/);
+
+        assert.strictEqual(context.browser, secondBrowser);
+        sinon.assert.notCalled(secondBrowser.off);
+        await context.dispose();
+      });
+    });
+
+    it('fences a stale initialization when the same browser is reconnected', async () => {
+      const browser = createBrowser();
+      const context = createLazyContext(async () => browser);
+      const hangingSnapshot = Promise.withResolvers<McpPage[]>();
+      const createPagesSnapshot = sinon
+        .stub(context, 'createPagesSnapshot')
+        .callThrough()
+        .onFirstCall()
+        .returns(hangingSnapshot.promise);
+
+      const staleCall = context.ensureBrowser();
+      await new Promise(resolve => setImmediate(resolve));
+      sinon.assert.calledOnce(createPagesSnapshot);
+
+      await context.dispose();
+      await context.ensureBrowser();
+      const currentOnCalls = browser.on.callCount;
+
+      hangingSnapshot.resolve([]);
+      await assert.rejects(staleCall, /Browser was replaced/);
+
+      assert.strictEqual(context.browser, browser);
+      sinon.assert.callCount(browser.on, currentOnCalls);
+      await context.dispose();
+    });
+
+    describe('when the same browser is returned during a hanging initialization', () => {
+      function setUpHangingInit() {
+        const browser = createBrowser();
+        const context = createLazyContext(async () => browser);
+        const hangingSnapshot = Promise.withResolvers<McpPage[]>();
+        const createPagesSnapshot = sinon
+          .stub(context, 'createPagesSnapshot')
+          .callThrough()
+          .onFirstCall()
+          .returns(hangingSnapshot.promise);
+        return {context, browser, hangingSnapshot, createPagesSnapshot};
+      }
+
+      it('waits for the pending initialization', async () => {
+        const {context, browser, hangingSnapshot, createPagesSnapshot} =
+          setUpHangingInit();
+
+        const firstCall = context.ensureBrowser();
+        let joinedCallSettled = false;
+        const joinedCall = context.ensureBrowser().finally(() => {
+          joinedCallSettled = true;
+        });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.ok(!joinedCallSettled);
+
+        hangingSnapshot.resolve([]);
+        assert.strictEqual(await firstCall, browser);
+        assert.strictEqual(await joinedCall, browser);
+        sinon.assert.calledOnce(createPagesSnapshot);
+        sinon.assert.notCalled(browser.off);
+        await context.dispose();
+      });
+
+      it('fails the joined call too and starts over on the next call', async () => {
+        const {context, browser, hangingSnapshot, createPagesSnapshot} =
+          setUpHangingInit();
+
+        const firstCall = context.ensureBrowser();
+        const joinedCall = context.ensureBrowser();
+        hangingSnapshot.reject(new Error('init failed'));
+        await assert.rejects(firstCall, /init failed/);
+        await assert.rejects(joinedCall, /init failed/);
+        assert.throws(() => context.browser, /Not connected to a browser/);
+
+        assert.strictEqual(await context.ensureBrowser(), browser);
+        sinon.assert.calledTwice(createPagesSnapshot);
+        await context.dispose();
+      });
     });
   });
 
@@ -819,12 +1293,12 @@ describe('McpContext', () => {
         const browser = getMockBrowser();
         browser.pages = async () => [];
         browser.targets = () => [];
-        return await McpContext.from(
+        return await createConnectedMcpContext(
           browser,
-          undefined,
           {
             experimentalDevToolsDebugging: false,
             performanceCrux: false,
+            heapSnapshotManager: new HeapSnapshotManager(),
             ...options,
           },
           Locator,
@@ -932,7 +1406,7 @@ describe('McpContext', () => {
               /Not allowed by allowlist/,
             );
           } finally {
-            context.dispose();
+            await context.dispose();
           }
         });
       });
@@ -959,7 +1433,7 @@ describe('McpContext', () => {
               /Blocked by blocklist/,
             );
           } finally {
-            context.dispose();
+            await context.dispose();
           }
         });
       });
@@ -995,7 +1469,7 @@ describe('McpContext', () => {
                 /Blocked by blocklist/,
               );
             } finally {
-              context.dispose();
+              await context.dispose();
             }
           },
         );
@@ -1022,7 +1496,7 @@ describe('McpContext', () => {
               'ALLOWED_BODY',
             );
           } finally {
-            context.dispose();
+            await context.dispose();
           }
         });
       });

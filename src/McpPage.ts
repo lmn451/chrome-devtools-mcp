@@ -37,6 +37,7 @@ import type {
   DevToolsData,
   MatchedStyles,
   Response,
+  ScreenRecorderData,
 } from './tools/ToolDefinition.js';
 import type {
   EmulationSettings,
@@ -153,6 +154,7 @@ export class McpPage implements ContextPage {
   #initPromise?: Promise<void>;
   #disposed = false;
   #closed = false;
+  #disposePromise?: Promise<void>;
 
   // Snapshot
   textSnapshot: TextSnapshot | null = null;
@@ -170,7 +172,8 @@ export class McpPage implements ContextPage {
   #dialog?: Dialog;
   #dialogHandler: (dialog: Dialog) => void;
 
-  eventBasedThirdPartyTools: ToolGroups = [];
+  // Screencast
+  #screenRecorder: ScreenRecorderData | null = null;
 
   #networkCollector?: NetworkCollector;
   #consoleCollector?: ConsoleCollector;
@@ -180,7 +183,6 @@ export class McpPage implements ContextPage {
   #navigationTimeout: number;
   #sourceMaps: boolean;
   #commentBridge?: DevToolsCommentBridge;
-  #onNotification?: (message: string) => void;
   #loadResource?: (url: string) => Promise<string>;
 
   constructor(
@@ -192,7 +194,6 @@ export class McpPage implements ContextPage {
       isolatedContextName?: string;
       navigationTimeout?: number;
       sourceMaps?: boolean;
-      onNotification?: (message: string) => void;
       loadResource?: (url: string) => Promise<string>;
     },
   ) {
@@ -200,7 +201,6 @@ export class McpPage implements ContextPage {
     this.#locatorClass = options.locatorClass;
     this.#navigationTimeout = options.navigationTimeout ?? NAVIGATION_TIMEOUT;
     this.#sourceMaps = options.sourceMaps ?? true;
-    this.#onNotification = options.onNotification;
     this.#loadResource = options.loadResource;
     this.target = target;
     this.id = id;
@@ -283,7 +283,7 @@ export class McpPage implements ContextPage {
       this.#pptrPage ??
       (await this.target.page()) ??
       (await this.target.asPage());
-    this.dispose();
+    await this.disposeAsync();
     await page?.close({runBeforeUnload: false});
   }
 
@@ -336,9 +336,6 @@ export class McpPage implements ContextPage {
       this.#initDevToolsUniverseNoThrow(),
       this.#initFocusEmulationNoThrow(),
     ]);
-    if (this.#disposed) {
-      this.dispose();
-    }
   }
 
   async #initFocusEmulationNoThrow(): Promise<void> {
@@ -349,16 +346,38 @@ export class McpPage implements ContextPage {
   }
 
   async #initDevToolsUniverseNoThrow(): Promise<void> {
-    if (this.#devtoolsUniverse) {
-      return undefined;
+    if (this.#devtoolsUniverse || this.#disposed) {
+      return;
     }
+
+    let session: Awaited<ReturnType<Page['createCDPSession']>> | undefined;
     try {
-      const session = await this.pptrPage.createCDPSession();
-      this.#devtoolsUniverse = await createTargetUniverse(session, {
+      session = await this.pptrPage.createCDPSession();
+      if (this.#disposed) {
+        await session.detach();
+        return;
+      }
+      const devtoolsUniverse = await createTargetUniverse(session, {
         sourceMaps: this.#sourceMaps,
         loadResource: this.#loadResource,
       });
+      if (this.#disposed) {
+        devtoolsUniverse.universe.dispose();
+        await devtoolsUniverse.session.detach();
+        return;
+      }
+      this.#devtoolsUniverse = devtoolsUniverse;
     } catch (e) {
+      if (session) {
+        try {
+          await session.detach();
+        } catch (detachError) {
+          logger?.(
+            'Failed to detach DevTools session after initialization',
+            detachError,
+          );
+        }
+      }
       logger?.('Failed to initialize DevTools universe', e);
     }
   }
@@ -373,6 +392,14 @@ export class McpPage implements ContextPage {
 
   clearDialog(): void {
     this.#dialog = undefined;
+  }
+
+  getScreenRecorder(): ScreenRecorderData | null {
+    return this.#screenRecorder;
+  }
+
+  setScreenRecorder(data: ScreenRecorderData | null): void {
+    this.#screenRecorder = data;
   }
 
   throwIfDialogOpen(): void {
@@ -403,14 +430,7 @@ export class McpPage implements ContextPage {
     ];
   }
 
-  getThirdPartyDeveloperTools(): ToolGroups {
-    return [
-      ...this.#getDebuggingWebMcpToolGroups(),
-      ...this.eventBasedThirdPartyTools,
-    ];
-  }
-
-  async getToolGroups(): Promise<ToolGroups> {
+  async discoverThirdPartyDeveloperTools(): Promise<ToolGroups> {
     // Check if there is a `devtoolstooldiscovery` event listener
     using windowHandle = await this.pptrPage.evaluateHandle(() => window);
     // @ts-expect-error internal API
@@ -420,8 +440,7 @@ export class McpPage implements ContextPage {
         objectId: windowHandle.remoteObject().objectId,
       });
     if (listeners.find(l => l.type === 'devtoolstooldiscovery') === undefined) {
-      this.eventBasedThirdPartyTools = [];
-      return this.getThirdPartyDeveloperTools();
+      return this.#getDebuggingWebMcpToolGroups();
     }
 
     const eventToolGroups = await this.pptrPage.evaluate(() => {
@@ -507,9 +526,7 @@ export class McpPage implements ContextPage {
       }
     }
 
-    this.eventBasedThirdPartyTools = eventToolGroups;
-
-    return this.getThirdPartyDeveloperTools();
+    return [...this.#getDebuggingWebMcpToolGroups(), ...eventToolGroups];
   }
 
   getWebMcpTools(): WebMCPTool[] {
@@ -559,9 +576,7 @@ export class McpPage implements ContextPage {
     devtoolsPage: Page,
   ): Promise<DevToolsCommentBridge | undefined> {
     if (!this.#commentBridge) {
-      this.#commentBridge = new DevToolsCommentBridge({
-        onNotification: this.#onNotification,
-      });
+      this.#commentBridge = new DevToolsCommentBridge();
     }
     const attached = await this.#commentBridge.attach(devtoolsPage);
     return attached ? this.#commentBridge : undefined;
@@ -665,18 +680,54 @@ export class McpPage implements ContextPage {
   }
 
   dispose(): void {
+    void this.disposeAsync().catch(e => {
+      logger?.('Failed to dispose page', e);
+    });
+  }
+
+  async disposeAsync(): Promise<void> {
+    if (this.#disposePromise !== undefined) {
+      return await this.#disposePromise;
+    }
+
+    // Mark and detach synchronously before the first await so no more events
+    // are accepted while asynchronous recorder/session cleanup is in flight.
     this.#disposed = true;
     this.#commentBridge?.dispose();
     this.#commentBridge = undefined;
     this.#pptrPage?.off('dialog', this.#dialogHandler);
     this.#networkCollector?.dispose();
     this.#consoleCollector?.dispose();
+
+    const recorder = this.#screenRecorder?.recorder;
+    this.#screenRecorder = null;
+    const initPromise = this.#initPromise;
     const devtoolsUniverse = this.#devtoolsUniverse;
     this.#devtoolsUniverse = undefined;
     devtoolsUniverse?.universe.dispose();
-    void devtoolsUniverse?.session.detach().catch(e => {
-      logger?.('Failed to detach DevTools session', e);
-    });
+
+    this.#disposePromise = (async (): Promise<void> => {
+      if (initPromise) {
+        try {
+          await initPromise;
+        } catch (e) {
+          logger?.('Failed to finish page initialization during dispose', e);
+        }
+      }
+      if (recorder) {
+        try {
+          await recorder.stop();
+        } catch (e) {
+          logger?.('Failed to stop screencast recording on dispose', e);
+        }
+      }
+      try {
+        await devtoolsUniverse?.session.detach();
+      } catch (e) {
+        logger?.('Failed to detach DevTools session', e);
+      }
+    })();
+    return await this.#disposePromise;
   }
 
   async executeThirdPartyDeveloperTool(
@@ -1075,7 +1126,6 @@ export class McpPage implements ContextPage {
       await this.ensureDevToolsCommentBridge(devtoolsPage);
       const {cdpRequestId, cdpBackendNodeId} = await devtoolsPage.evaluate(
         async () => {
-          window.universe?.cd4aBridge?.setAgentAttached(true);
           // @ts-expect-error no types
           const UI = await import('/bundled/ui/legacy/legacy.js');
           // @ts-expect-error no types
@@ -1101,6 +1151,19 @@ export class McpPage implements ContextPage {
 
   async restoreEmulation(): Promise<void> {
     const currentSetting = this.emulationSettings;
+    const {viewport} = currentSetting;
+    if (viewport) {
+      // Lighthouse's CDP session replaces the device metrics override and
+      // clears it on detach, and Chrome ignores an override identical to the
+      // last one this session sent. A different width first makes the real
+      // call take effect without a reload (`isMobile` and `hasTouch` stay the
+      // same). This also runs after snapshot audits and fires a resize event,
+      // so do not remove it as redundant.
+      await this.pptrPage.setViewport({
+        ...viewport,
+        width: Math.max(1, viewport.width - 1),
+      });
+    }
     await this.emulate(currentSetting);
   }
 
@@ -1245,13 +1308,26 @@ export class McpPage implements ContextPage {
       }
     }
 
+    const previousViewport = this.emulationSettings.viewport;
     this.emulationSettings = Object.keys(newSettings).length ? newSettings : {};
 
     this.updateTimeouts();
 
     // This should happen after updating the page timeouts.
     // Setting the viewport can trigger a reload which we don't want to timeout.
-    await page.setViewport(newSettings.viewport ?? null);
+    try {
+      await page.setViewport(newSettings.viewport ?? null);
+    } catch (error) {
+      if (previousViewport) {
+        newSettings.viewport = previousViewport;
+      } else {
+        delete newSettings.viewport;
+      }
+      this.emulationSettings = Object.keys(newSettings).length
+        ? newSettings
+        : {};
+      throw error;
+    }
   }
 
   updateTimeouts(): void {
