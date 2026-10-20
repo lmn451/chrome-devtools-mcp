@@ -280,10 +280,8 @@ describe('shared-browser HTTP MCP service', () => {
         {},
         false,
       );
-      const serverArgs = configParser.applyDefaults(
-        configParser.parseCliArgs(),
-      );
-      service = await startMcpHttpServer(serverArgs, {port: 0});
+      const serverConfig = configParser.parseConfig();
+      service = await startMcpHttpServer(serverConfig, {port: 0});
       const root: Root = {
         uri: pathToFileURL(rootPath).href,
         name: 'client-a-home-temp-root',

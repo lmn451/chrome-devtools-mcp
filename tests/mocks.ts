@@ -29,12 +29,13 @@ import sinon from 'sinon';
 
 import {
   type ParsedArguments,
-  ConfigParser,
-} from '../src/config/ConfigParser.js';
+  ServerConfig,
+} from '../src/config/ServerConfig.js';
 import {McpContext} from '../src/McpContext.js';
 import {McpPage} from '../src/McpPage.js';
 import {McpResponse} from '../src/McpResponse.js';
 import {McpWorker, type WorkerType} from '../src/McpWorker.js';
+import {TaskRunner, type TaskQueue} from '../src/utils/TaskRunner.js';
 import type {
   DuplicateStringGroup,
   HeapSnapshotAggregate,
@@ -54,6 +55,7 @@ import {
   CdpPage,
   CDPSession,
   Connection,
+  ConsoleMessage,
   DevTools,
   Dialog,
   ElementHandle,
@@ -68,7 +70,10 @@ import {
 import type {
   Browser,
   BrowserContext,
+  ConsoleMessageLocation,
+  ConsoleMessageType,
   Extension,
+  JSHandle,
   Page,
   Protocol,
   Realm,
@@ -431,12 +436,16 @@ export function createMockPuppeteerTarget(
 
 export function createMockMcpPage(
   options: {
+    id?: number;
     pptrPage?: MockPuppeteerPage;
     target?: sinon.SinonStubbedInstance<MockTarget>;
   } = {},
 ): MockMcpPage {
   const page = sinon.createStubInstance(McpPage);
   page.emulationSettings = {};
+  if (options.id !== undefined) {
+    Object.defineProperty(page, 'id', {value: options.id});
+  }
   const pptrPage = options.pptrPage ?? createMockPuppeteerPage();
   const target = options.target ?? createMockPuppeteerTarget({page: pptrPage});
   page.init.resolves();
@@ -466,11 +475,16 @@ export function createMockMcpPage(
 }
 
 export function createMockDialog(
-  options: {type?: Protocol.Page.DialogType; message?: string} = {},
+  options: {
+    type?: Protocol.Page.DialogType;
+    message?: string;
+    handled?: boolean;
+  } = {},
 ): sinon.SinonStubbedInstance<Dialog> {
   const dialog = sinon.createStubInstance(Dialog);
   dialog.type.returns(options.type ?? 'alert');
   dialog.message.returns(options.message ?? '');
+  sinon.stub(dialog, 'handled').get(() => options.handled ?? false);
   return dialog;
 }
 
@@ -530,12 +544,25 @@ export function createMockMcpWorker(
 }
 
 export function createMockMcpContext(
-  options: {selectedPage?: MockMcpPage} = {},
+  options: {selectedPage?: MockMcpPage; taskRunner?: TaskRunner} = {},
 ): MockMcpContext {
   const context = sinon.createStubInstance(McpContext);
   const page = options.selectedPage ?? createMockMcpPage();
   context.getSelectedMcpPage.returns(page satisfies McpPage);
   context.getTargetInfos.resolves(new Map());
+  // Real queues, so handler tests observe the real scheduling.
+  const taskRunner = options.taskRunner ?? new TaskRunner();
+  const taskQueue = taskRunner.createQueue();
+  Object.defineProperty(context, 'taskQueue', {value: taskQueue});
+  const pageTaskQueues = new Map<number, TaskQueue>();
+  context.pageTaskQueue.callsFake(pageId => {
+    let queue = pageTaskQueues.get(pageId);
+    if (!queue) {
+      queue = taskRunner.createQueue(taskQueue);
+      pageTaskQueues.set(pageId, queue);
+    }
+    return queue;
+  });
 
   return context;
 }
@@ -1299,16 +1326,36 @@ export function createMockContextAnalysisResult(): DevTools.HeapSnapshotModel.He
   };
 }
 
+export function stripUndefined<T extends object>(options: T): T {
+  const result = {...options};
+  for (const [key, value] of Object.entries(result)) {
+    if (value === undefined) {
+      Reflect.deleteProperty(result, key);
+    }
+  }
+  return result;
+}
+
 export function createMockParsedArguments(
   options: Partial<ParsedArguments> = {},
 ): ParsedArguments {
-  const defaultArgs = new ConfigParser(
-    '0.0.0',
-    ['node', 'main.js'],
-    process.env,
-    false,
-  ).parse();
-  return {...defaultArgs, ...options};
+  const defaultArgs = ServerConfig.applyDefaults(
+    {},
+    {suppressUsageStatisticsNotice: true},
+  );
+  return {...defaultArgs, ...stripUndefined(options)};
+}
+
+export function createMockServerConfig(
+  options: Partial<ParsedArguments> = {},
+): ServerConfig {
+  const definedOptions = stripUndefined(options);
+  return new ServerConfig({
+    cliArgs: definedOptions,
+    fileArgs: {},
+    configPath: definedOptions.config,
+    resolved: createMockParsedArguments(definedOptions),
+  });
 }
 
 export function createMockHeapSnapshotNode(
@@ -1351,4 +1398,20 @@ export function createMockHeapSnapshotAggregate(
     selfSize: options.selfSize ?? 10,
     retainedSize: options.retainedSize ?? 100,
   };
+}
+
+export function createMockConsoleMessage(
+  options: {
+    type?: ConsoleMessageType;
+    text?: string;
+    args?: JSHandle[];
+    location?: ConsoleMessageLocation;
+  } = {},
+): sinon.SinonStubbedInstance<ConsoleMessage> {
+  const message = sinon.createStubInstance(ConsoleMessage);
+  message.type.returns(options.type ?? 'log');
+  message.text.returns(options.text ?? '');
+  message.args.returns(options.args ?? []);
+  message.location.returns(options.location ?? {});
+  return message;
 }

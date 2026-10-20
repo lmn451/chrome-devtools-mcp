@@ -20,7 +20,7 @@ import {
   isInitializeRequest,
   WebStandardStreamableHTTPServerTransport,
 } from './third_party/index.js';
-import type {ParsedArguments} from './config/ConfigParser.js';
+import type {ServerConfig} from './config/ServerConfig.js';
 import {logger} from './utils/logger.js';
 
 const MCP_PATH = '/mcp';
@@ -469,9 +469,10 @@ function closeNodeServer(server: Server): Promise<void> {
   return promise;
 }
 export async function startMcpHttpServer(
-  serverArgs: ParsedArguments,
+  serverConfig: ServerConfig,
   options: McpHttpServerOptions,
 ): Promise<McpHttpServer> {
+  const serverArgs = serverConfig.resolved;
   validatePort(options.port);
   const maxSessions = resolvePositiveLimit(
     options.maxSessions,
@@ -578,7 +579,7 @@ export async function startMcpHttpServer(
         }
       },
     });
-    const server = await McpServer.from(serverArgs, {
+    const server = await McpServer.from(serverConfig.clone(), {
       browserManager,
       closeBrowserManager: false,
       logFile: options.logFile,

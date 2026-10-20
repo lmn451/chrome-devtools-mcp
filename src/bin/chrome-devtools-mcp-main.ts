@@ -29,7 +29,8 @@ await checkForUpdates(
 );
 
 const configParser = new ConfigParser(VERSION);
-export const args = configParser.parse();
+const serverConfig = configParser.parseConfig();
+const args = serverConfig.resolved;
 
 const logFile = args.logFile ? saveLogsToFile(args.logFile) : undefined;
 const serverUrl = args.serverUrl ? new URL(args.serverUrl) : undefined;
@@ -108,14 +109,14 @@ if (isProxyMode) {
   await proxyPromise;
   await shutdown('stdio proxy closed');
 } else if (args.httpPort !== undefined) {
-  httpServer = await startMcpHttpServer(args, {
+  httpServer = await startMcpHttpServer(serverConfig, {
     port: args.httpPort,
     logFile,
   });
   logger?.(`Chrome DevTools MCP Server listening at ${httpServer.url.href}`);
   logDisclaimers(args);
 } else {
-  stdioServer = await McpServer.from(args, {
+  stdioServer = await McpServer.from(serverConfig, {
     browserManager: new BrowserManager(args, {logFile}),
     logFile,
   });

@@ -285,12 +285,15 @@ export class SymbolizedError {
     devTools?: TargetUniverse;
     details: ExceptionDetailsLike;
     targetId: string;
+    // The session that reported `details`. Remote object ids are scoped to
+    // the session that issued them, so the cause has to be resolved there.
+    session?: CDPSession;
     includeStackAndCause?: boolean;
     resolvedStackTraceForTesting?: DevTools.StackTrace.StackTrace.StackTrace;
     resolvedCauseForTesting?: SymbolizedError;
   }): Promise<SymbolizedError> {
     const message = SymbolizedError.#getMessage(opts.details);
-    if (!opts.includeStackAndCause || !opts.devTools) {
+    if (!opts.includeStackAndCause || (!opts.devTools && !opts.session)) {
       return new SymbolizedError(
         message,
         opts.resolvedStackTraceForTesting,
@@ -301,7 +304,7 @@ export class SymbolizedError {
     let stackTrace: DevTools.StackTrace.StackTrace.StackTrace | undefined;
     if (opts.resolvedStackTraceForTesting) {
       stackTrace = opts.resolvedStackTraceForTesting;
-    } else if (opts.details.stackTrace) {
+    } else if (opts.devTools && opts.details.stackTrace) {
       try {
         stackTrace = await createStackTrace(
           opts.devTools,
@@ -324,12 +327,14 @@ export class SymbolizedError {
           opts.devTools,
           opts.details.exception,
           opts.targetId,
+          opts.session,
         );
         if (causeRemoteObj) {
           cause = await SymbolizedError.fromError({
             devTools: opts.devTools,
             error: causeRemoteObj,
             targetId: opts.targetId,
+            session: opts.session,
           });
         }
       } catch {
@@ -343,17 +348,20 @@ export class SymbolizedError {
     devTools?: TargetUniverse;
     error: RemoteObjectLike;
     targetId: string;
+    session?: CDPSession;
   }): Promise<SymbolizedError> {
     const details = await SymbolizedError.#getExceptionDetails(
       opts.devTools,
       opts.error,
       opts.targetId,
+      opts.session,
     );
     if (details) {
       return await SymbolizedError.fromDetails({
         details,
         devTools: opts.devTools,
         targetId: opts.targetId,
+        session: opts.session,
         includeStackAndCause: true,
       });
     }
@@ -400,8 +408,24 @@ export class SymbolizedError {
     devTools: TargetUniverse | undefined,
     error: RemoteObjectLike,
     targetId: string,
-  ): Promise<DevTools.Protocol.Runtime.ExceptionDetails | null> {
-    if (!devTools || (error.type !== 'object' && error.subtype !== 'error')) {
+    session?: CDPSession,
+  ): Promise<ExceptionDetailsLike | null> {
+    if (error.type !== 'object' && error.subtype !== 'error') {
+      return null;
+    }
+
+    if (session) {
+      if (!error.objectId) {
+        return null;
+      }
+      const {exceptionDetails} = await session.send(
+        'Runtime.getExceptionDetails',
+        {errorObjectId: error.objectId},
+      );
+      return exceptionDetails ?? null;
+    }
+
+    if (!devTools) {
       return null;
     }
 
@@ -421,8 +445,23 @@ export class SymbolizedError {
     devTools: TargetUniverse | undefined,
     error: RemoteObjectLike,
     targetId: string,
-  ): Promise<DevTools.Protocol.Runtime.RemoteObject | null> {
-    if (!devTools || (error.type !== 'object' && error.subtype !== 'error')) {
+    session?: CDPSession,
+  ): Promise<RemoteObjectLike | null> {
+    if (error.type !== 'object' && error.subtype !== 'error') {
+      return null;
+    }
+
+    if (session) {
+      if (!error.objectId) {
+        return null;
+      }
+      const {result} = await session.send('Runtime.getProperties', {
+        objectId: error.objectId,
+      });
+      return result.find(prop => prop.name === 'cause')?.value ?? null;
+    }
+
+    if (!devTools) {
       return null;
     }
 

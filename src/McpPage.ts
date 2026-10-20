@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import type {ReadonlyServerConfig} from './config/ServerConfig.js';
 import {DevToolsCommentBridge} from './devtools/DevToolsCommentBridge.js';
 import {
   createTargetUniverse,
@@ -152,6 +153,7 @@ export class McpPage implements ContextPage {
 
   #pptrPage?: Page;
   #initPromise?: Promise<void>;
+  #focusEmulationRequested = false;
   #disposed = false;
   #closed = false;
   #disposePromise?: Promise<void>;
@@ -175,13 +177,15 @@ export class McpPage implements ContextPage {
   // Screencast
   #screenRecorder: ScreenRecorderData | null = null;
 
+  // Performance trace
+  #isRunningPerformanceTrace = false;
+
   #networkCollector?: NetworkCollector;
   #consoleCollector?: ConsoleCollector;
 
-  #hasNetworkBlockOrAllowlist: boolean;
   #locatorClass: typeof Locator;
   #navigationTimeout: number;
-  #sourceMaps: boolean;
+  #config: ReadonlyServerConfig;
   #commentBridge?: DevToolsCommentBridge;
   #loadResource?: (url: string) => Promise<string>;
 
@@ -189,18 +193,16 @@ export class McpPage implements ContextPage {
     target: Target,
     id: number,
     options: {
-      hasNetworkBlockOrAllowlist: boolean;
+      config: ReadonlyServerConfig;
       locatorClass: typeof Locator;
       isolatedContextName?: string;
       navigationTimeout?: number;
-      sourceMaps?: boolean;
       loadResource?: (url: string) => Promise<string>;
     },
   ) {
-    this.#hasNetworkBlockOrAllowlist = options.hasNetworkBlockOrAllowlist;
+    this.#config = options.config;
     this.#locatorClass = options.locatorClass;
     this.#navigationTimeout = options.navigationTimeout ?? NAVIGATION_TIMEOUT;
-    this.#sourceMaps = options.sourceMaps ?? true;
     this.#loadResource = options.loadResource;
     this.target = target;
     this.id = id;
@@ -208,6 +210,13 @@ export class McpPage implements ContextPage {
     this.#dialogHandler = (dialog: Dialog): void => {
       this.#dialog = dialog;
     };
+  }
+
+  get #hasNetworkBlockOrAllowlist(): boolean {
+    return Boolean(
+      this.#config.resolved.allowedUrlPattern ||
+      this.#config.resolved.blockedUrlPattern,
+    );
   }
 
   get pptrPage(): Page {
@@ -287,19 +296,26 @@ export class McpPage implements ContextPage {
     await page?.close({runBeforeUnload: false});
   }
 
-  async init(): Promise<void> {
+  async init(options?: {emulateFocus?: boolean}): Promise<void> {
     if (this.#disposed) {
       throw new Error(`McpPage (id=${this.id}) has already been disposed.`);
     }
-    if (this.#initPromise) {
-      return await this.#initPromise;
+    if (!this.#initPromise) {
+      this.#initPromise = this.#doInit().catch(err => {
+        this.#initPromise = undefined;
+        throw err;
+      });
     }
-    this.#initPromise = this.#doInit();
-    try {
-      await this.#initPromise;
-    } catch (err) {
-      this.#initPromise = undefined;
-      throw err;
+    await this.#initPromise;
+    // Discovery skips focus emulation, but a later page tool still needs it.
+    if (
+      options?.emulateFocus !== false &&
+      !this.#disposed &&
+      !this.#focusEmulationRequested
+    ) {
+      // Prevent duplicate requests while pending and after success.
+      this.#focusEmulationRequested = true;
+      this.#initFocusEmulationNoThrow();
     }
   }
 
@@ -332,15 +348,17 @@ export class McpPage implements ContextPage {
       });
     }
     this.updateTimeouts();
-    await Promise.allSettled([
-      this.#initDevToolsUniverseNoThrow(),
-      this.#initFocusEmulationNoThrow(),
-    ]);
+    await this.#initDevToolsUniverseNoThrow();
+    if (this.#disposed) {
+      this.dispose();
+    }
   }
 
-  async #initFocusEmulationNoThrow(): Promise<void> {
-    // We emulate a focused page for all pages to support multi-agent workflows.
+  #initFocusEmulationNoThrow(): void {
+    // Background pages need emulated focus for multi-agent workflows.
     void this.pptrPage.emulateFocusedPage(true).catch(error => {
+      // Allow the next page operation to retry a transient failure.
+      this.#focusEmulationRequested = false;
       logger?.('Error turning on focused page emulation', error);
     });
   }
@@ -358,7 +376,7 @@ export class McpPage implements ContextPage {
         return;
       }
       const devtoolsUniverse = await createTargetUniverse(session, {
-        sourceMaps: this.#sourceMaps,
+        sourceMaps: this.#config.resolved.sourceMaps,
         loadResource: this.#loadResource,
       });
       if (this.#disposed) {
@@ -382,11 +400,27 @@ export class McpPage implements ContextPage {
     }
   }
 
+  syncSourceMaps(): void {
+    if (!this.#devtoolsUniverse) {
+      return;
+    }
+    const sourceMaps = this.#config.resolved.sourceMaps;
+    this.#devtoolsUniverse.universe.settings
+      .resolve(DevTools.SDKSettings.jsSourceMapsEnabledSettingDescriptor)
+      .set(sourceMaps);
+    this.#devtoolsUniverse.universe.settings
+      .resolve(DevTools.SDKSettings.cssSourceMapsEnabledSettingDescriptor)
+      .set(sourceMaps);
+  }
+
   get devtoolsUniverse(): TargetUniverse | undefined {
     return this.#devtoolsUniverse;
   }
 
   getDialog(): Dialog | undefined {
+    if (this.#dialog?.handled) {
+      this.#dialog = undefined;
+    }
     return this.#dialog;
   }
 
@@ -402,10 +436,19 @@ export class McpPage implements ContextPage {
     this.#screenRecorder = data;
   }
 
+  isRunningPerformanceTrace(): boolean {
+    return this.#isRunningPerformanceTrace;
+  }
+
+  setIsRunningPerformanceTrace(x: boolean): void {
+    this.#isRunningPerformanceTrace = x;
+  }
+
   throwIfDialogOpen(): void {
-    if (this.#dialog && !this.#dialog.handled) {
+    const dialog = this.getDialog();
+    if (dialog) {
       throw new Error(
-        `A dialog is open (${this.#dialog.type()}: ${this.#dialog.message()}).`,
+        `A dialog is open (${dialog.type()}: ${dialog.message()}).`,
       );
     }
   }
@@ -568,6 +611,11 @@ export class McpPage implements ContextPage {
     return this.#commentBridge;
   }
 
+  disposeCommentBridge(): void {
+    this.#commentBridge?.dispose();
+    this.#commentBridge = undefined;
+  }
+
   /**
    * Returns the comment bridge attached to the DevTools page, or undefined if
    * the DevTools page does not support DevTools comments.
@@ -598,7 +646,9 @@ export class McpPage implements ContextPage {
 
   async openDevTools(): Promise<Page | undefined> {
     const devtoolsPage = await this.pptrPage.openDevTools();
-    await this.ensureDevToolsCommentBridge(devtoolsPage);
+    if (this.#config.resolved.devtoolsComments) {
+      await this.ensureDevToolsCommentBridge(devtoolsPage);
+    }
     return devtoolsPage;
   }
 
@@ -693,8 +743,8 @@ export class McpPage implements ContextPage {
     // Mark and detach synchronously before the first await so no more events
     // are accepted while asynchronous recorder/session cleanup is in flight.
     this.#disposed = true;
-    this.#commentBridge?.dispose();
-    this.#commentBridge = undefined;
+    this.#isRunningPerformanceTrace = false;
+    this.disposeCommentBridge();
     this.#pptrPage?.off('dialog', this.#dialogHandler);
     this.#networkCollector?.dispose();
     this.#consoleCollector?.dispose();
@@ -1123,7 +1173,9 @@ export class McpPage implements ContextPage {
         logger?.('No DevTools page detected');
         return {};
       }
-      await this.ensureDevToolsCommentBridge(devtoolsPage);
+      if (this.#config.resolved.devtoolsComments) {
+        await this.ensureDevToolsCommentBridge(devtoolsPage);
+      }
       const {cdpRequestId, cdpBackendNodeId} = await devtoolsPage.evaluate(
         async () => {
           // @ts-expect-error no types
@@ -1244,7 +1296,18 @@ export class McpPage implements ContextPage {
     }
 
     if (!options.geolocation) {
-      await page.setGeolocation({latitude: 0, longitude: 0});
+      if (newSettings.geolocation) {
+        if (secondarySession) {
+          await secondarySession.send('Emulation.clearGeolocationOverride');
+        } else {
+          const session = await page.createCDPSession();
+          try {
+            await session.send('Emulation.clearGeolocationOverride');
+          } finally {
+            await session.detach();
+          }
+        }
+      }
       delete newSettings.geolocation;
     } else {
       await page.setGeolocation(options.geolocation);

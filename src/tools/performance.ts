@@ -54,20 +54,20 @@ export const startTrace = definePageTool(() => ({
     filePath: filePathSchema,
   },
   blockedByDialog: true,
+  concurrency: 'exclusive',
   verifyFilesSchema: {
     filePath: true,
   },
   handler: async (request, response, context) => {
+    const page = request.page;
     if (context.isRunningPerformanceTrace()) {
       response.appendResponseLine(
         'Error: a performance trace is already running. Use performance_stop_trace to stop it. Only one trace can be running at any given time.',
       );
       return;
     }
-    context.setIsRunningPerformanceTrace(true);
-    context.setPerformanceTracePage(request.page);
+    page.setIsRunningPerformanceTrace(true);
 
-    const page = request.page;
     const pageUrlForTracing = page.pptrPage.url();
 
     try {
@@ -129,14 +129,13 @@ export const startTrace = definePageTool(() => ({
       // Unwind here: stop tracing if it was started and clear the flag. When
       // autoStop already ran stopTracingAndAppendOutput the flag is already
       // false and this is a no-op.
-      if (context.isRunningPerformanceTrace()) {
+      if (page.isRunningPerformanceTrace()) {
         try {
           await page.pptrPage.tracing.stop();
         } catch {
           // Tracing may not have started yet; ignore.
         }
-        context.setIsRunningPerformanceTrace(false);
-        context.setPerformanceTracePage(undefined);
+        page.setIsRunningPerformanceTrace(false);
       }
       throw error;
     }
@@ -155,17 +154,18 @@ export const stopTrace = definePageTool(() => ({
     filePath: filePathSchema,
   },
   blockedByDialog: true,
+  concurrency: 'exclusive',
   verifyFilesSchema: {
     filePath: true,
   },
   handler: async (request, response, context) => {
-    if (!context.isRunningPerformanceTrace()) {
+    const page = request.page;
+    if (!page.isRunningPerformanceTrace()) {
       response.appendResponseLine(
         'Error: no active performance trace recording to stop.',
       );
       return;
     }
-    const page = context.getPerformanceTracePage() ?? request.page;
     await stopTracingAndAppendOutput(
       page,
       response,
@@ -196,6 +196,7 @@ export const analyzeInsight = definePageTool(() => ({
       ),
   },
   blockedByDialog: false,
+  concurrency: 'exclusive',
   verifyFilesSchema: {},
   handler: async (request, response, context) => {
     const lastRecording = context.recordedTraces().at(-1);
@@ -261,8 +262,7 @@ async function stopTracingAndAppendOutput(
       );
     }
   } finally {
-    context.setIsRunningPerformanceTrace(false);
-    context.setPerformanceTracePage(undefined);
+    page.setIsRunningPerformanceTrace(false);
   }
 }
 

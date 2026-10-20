@@ -20,7 +20,7 @@ const configParser = new ConfigParser(
   {},
   false,
 );
-const serverArgs = configParser.applyDefaults(configParser.parseCliArgs());
+const serverConfig = configParser.parseConfig();
 
 const initializeMessage = {
   jsonrpc: '2.0',
@@ -85,7 +85,7 @@ function statusWithHost(url: URL, host: string): Promise<number> {
 
 describe('Streamable HTTP MCP server', () => {
   it('rejects invalid routes, methods, hosts, and origins before protocol handling', async () => {
-    const service = await startMcpHttpServer(serverArgs, {port: 0});
+    const service = await startMcpHttpServer(serverConfig, {port: 0});
     try {
       const wrongRoute = await fetch(`${service.url.origin}/not-mcp`);
       assert.equal(wrongRoute.status, 404);
@@ -108,7 +108,7 @@ describe('Streamable HTTP MCP server', () => {
     }
   });
   it('admits only valid initialize requests and enforces request limits', async () => {
-    const service = await startMcpHttpServer(serverArgs, {
+    const service = await startMcpHttpServer(serverConfig, {
       port: 0,
       maxSessions: 1,
     });
@@ -186,7 +186,7 @@ describe('Streamable HTTP MCP server', () => {
   });
 
   it('expires idle sessions without retaining their transport', async () => {
-    const service = await startMcpHttpServer(serverArgs, {
+    const service = await startMcpHttpServer(serverConfig, {
       port: 0,
       sessionIdleTimeoutMs: 20,
     });
@@ -208,7 +208,7 @@ describe('Streamable HTTP MCP server', () => {
   });
 
   it('routes independent sessions and only closes the requested session', async () => {
-    const service = await startMcpHttpServer(serverArgs, {port: 0});
+    const service = await startMcpHttpServer(serverConfig, {port: 0});
     try {
       const firstSession = await initialize(service.url);
       const secondSession = await initialize(service.url);

@@ -5,7 +5,7 @@
  */
 
 import assert from 'node:assert';
-import {afterEach, describe, it} from 'node:test';
+import {describe, it} from 'node:test';
 
 import sinon from 'sinon';
 
@@ -30,10 +30,6 @@ function trackResponseLines(
 }
 
 describe('comments tools', () => {
-  afterEach(() => {
-    sinon.restore();
-  });
-
   describe('get_devtools_comments', () => {
     it('reports error when DevTools window is not open', async t => {
       const {page, context, response, args} = createHandlerMocks();
@@ -93,9 +89,9 @@ describe('comments tools', () => {
       ]);
     });
 
-    it('yields the tool lock while waiting', () => {
+    it('runs the handler unlocked while waiting', () => {
       const {args} = createHandlerMocks();
-      assert.strictEqual(getDevtoolsComments(args).yieldsToolLock, true);
+      assert.strictEqual(getDevtoolsComments(args).concurrency, 'none');
     });
 
     it('waits for a comment event and fetches again', async () => {

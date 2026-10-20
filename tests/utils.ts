@@ -34,6 +34,7 @@ import {isDaemonRunning} from '../src/daemon/utils.js';
 import {McpContext, type McpContextOptions} from '../src/McpContext.js';
 import {McpResponse} from '../src/McpResponse.js';
 import {HeapSnapshotManager} from '../src/processors/HeapSnapshotManager.js';
+import {TaskRunner} from '../src/utils/TaskRunner.js';
 import {TextSnapshot} from '../src/TextSnapshot.js';
 import {DevTools} from '../src/third_party/index.js';
 import {stableIdSymbol} from '../src/utils/id.js';
@@ -41,7 +42,9 @@ import {stableIdSymbol} from '../src/utils/id.js';
 import {
   createMockParsedArguments,
   createMockPuppeteerPage,
+  createMockServerConfig,
   mockListener,
+  stripUndefined,
 } from './mocks.js';
 
 export function assertNoServiceWorkerReported(targets: Target[], id: string) {
@@ -176,12 +179,18 @@ export async function withBrowser(
  */
 export async function createConnectedMcpContext(
   browser: Browser,
-  options: Omit<McpContextOptions, 'getBrowser'>,
+  options: Omit<McpContextOptions, 'getBrowser' | 'taskRunner'> & {
+    taskRunner?: TaskRunner;
+  },
   locatorClass?: typeof Locator,
 ): Promise<McpContext> {
   const context = McpContext.create(
     undefined,
-    {...options, getBrowser: async () => browser},
+    {
+      taskRunner: new TaskRunner(),
+      ...options,
+      getBrowser: async () => browser,
+    },
     locatorClass,
   );
   await context.ensureBrowser();
@@ -213,28 +222,34 @@ export async function withMcpContext(
     McpContext.resetPageIdsForTesting();
     McpContext.resetWorkerIdsForTesting();
     const parsedArgs = createMockParsedArguments(args);
-    const response = new McpResponse(parsedArgs);
+    const serverConfig = createMockServerConfig({
+      ...args,
+      ...stripUndefined({
+        performanceCrux: options.performanceCrux,
+        sourceMaps: options.sourceMaps,
+        allowedUrlPattern: options.allowedUrlPattern,
+        blockedUrlPattern: options.blockedUrlPattern,
+        allowUnrestrictedPaths: options.allowUnrestrictedPaths,
+      }),
+    });
+    const response = new McpResponse(serverConfig);
+    const taskRunner = new TaskRunner();
+    const heapSnapshotManager = new HeapSnapshotManager(taskRunner);
     if (context) {
       await context.dispose();
     }
     currentHeapSnapshotManager?.dispose();
     context = undefined;
     currentHeapSnapshotManager = undefined;
-    const heapSnapshotManager = new HeapSnapshotManager();
     currentHeapSnapshotManager = heapSnapshotManager;
     context = await createConnectedMcpContext(
       browser,
       {
-        experimentalDevToolsDebugging: false,
-        performanceCrux: options.performanceCrux ?? true,
-        sourceMaps: options.sourceMaps ?? true,
-        allowlist: options.allowedUrlPattern,
-        blocklist: options.blockedUrlPattern,
-        allowUnrestrictedPaths: options.allowUnrestrictedPaths ?? false,
+        config: serverConfig,
+        taskRunner,
         navigationTimeout:
           options.navigationTimeout ??
           (process.platform === 'win32' ? 20000 : undefined),
-        categoryExtensions: parsedArgs.categoryExtensions,
         heapSnapshotManager,
       },
       Locator,

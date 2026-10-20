@@ -21,6 +21,7 @@ import {
   listConsoleMessages,
 } from '../../src/tools/console.js';
 import {installExtension} from '../../src/tools/extensions.js';
+import {createMockServerConfig} from '../mocks.js';
 import {serverHooks} from '../server.js';
 import {
   getTextContent,
@@ -62,7 +63,7 @@ describe('console', () => {
         const sw = swList.find(s => s.target === swTarget);
         assert(sw, 'Service worker not found in context list');
 
-        const response2 = new McpResponse(args);
+        const response2 = new McpResponse(createMockServerConfig(args));
 
         await context.triggerExtensionAction(extensionId);
         const worker = await swTarget.worker();
@@ -267,7 +268,7 @@ describe('console', () => {
         // setContent resolves, so poll until the collector has all three.
         let textContent = '';
         await waitExecutionFor(async () => {
-          const pollResponse = new McpResponse(args);
+          const pollResponse = new McpResponse(createMockServerConfig(args));
           pollResponse.setPage(page);
           await listConsoleMessages(args).handler(
             {params: {}, page},
@@ -465,7 +466,7 @@ describe('console', () => {
             response,
             context,
           );
-          const response2 = new McpResponse(args);
+          const response2 = new McpResponse(createMockServerConfig(args));
           response2.setPage(context.getSelectedMcpPage());
           await getConsoleMessage(args).handler(
             {params: {msgid: 1}, page: context.getSelectedMcpPage()},
@@ -521,7 +522,7 @@ describe('console', () => {
             response,
             context,
           );
-          const response2 = new McpResponse(args);
+          const response2 = new McpResponse(createMockServerConfig(args));
           response2.setPage(context.getSelectedMcpPage());
           await getConsoleMessage(args).handler(
             {params: {msgid: id}, page: context.getSelectedMcpPage()},
@@ -716,6 +717,37 @@ console.error('inline-line-4');
         const rawText = getTextContent(formattedResponse.content[0]);
 
         t.assert.snapshot(rawText);
+      });
+    });
+
+    it('resolves the cause of an uncaught exception thrown after load', async () => {
+      server.addHtmlRoute(
+        '/index.html',
+        `<!DOCTYPE html><script>
+          window.addEventListener('load', () => {
+            setTimeout(() => {
+              window.thrown = true;
+              throw new Error('outer', {cause: new Error('inner')});
+            }, 100);
+          });
+        </script>`,
+      );
+
+      await withMcpContext(async (response, context, args) => {
+        const page = context.getSelectedMcpPage();
+        await page.pptrPage.goto(server.getRoute('/index.html'));
+        await page.pptrPage.waitForFunction(() => 'thrown' in window);
+
+        await getConsoleMessage(args).handler(
+          {params: {msgid: 1}, page: context.getSelectedMcpPage()},
+          response,
+          context,
+        );
+        const formattedResponse = await response.handle(context);
+        const rawText = getTextContent(formattedResponse.content[0]);
+
+        assert.ok(rawText.includes('Uncaught Error: outer'), rawText);
+        assert.ok(rawText.includes('Caused by: Error: inner'), rawText);
       });
     });
 

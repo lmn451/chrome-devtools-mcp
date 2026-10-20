@@ -6,12 +6,11 @@
 
 import assert from 'node:assert';
 import path from 'node:path';
-import {afterEach, describe, it} from 'node:test';
+import {describe, it} from 'node:test';
 
 import type {Dialog} from 'puppeteer-core';
 import sinon from 'sinon';
 
-import {ConfigParser} from '../../src/config/ConfigParser.js';
 import {
   listPages,
   newPage,
@@ -23,7 +22,12 @@ import {
   getTabId,
 } from '../../src/tools/pages.js';
 import {zod} from '../../src/third_party/index.js';
-import {createHandlerMocks, createMockParsedArguments} from '../mocks.js';
+import {
+  createHandlerMocks,
+  createMockDialog,
+  createMockMcpPage,
+  createMockParsedArguments,
+} from '../mocks.js';
 import {assertNoServiceWorkerReported, html, withMcpContext} from '../utils.js';
 
 const EXTENSION_SW_PATH = path.join(
@@ -40,10 +44,6 @@ const EXTENSION_SIDE_PANEL_PATH = path.join(
 );
 
 describe('pages', () => {
-  afterEach(() => {
-    sinon.restore();
-  });
-
   describe('list_pages', () => {
     it('list pages', async () => {
       const {context, response, args} = createHandlerMocks();
@@ -254,6 +254,79 @@ describe('pages', () => {
       sinon.assert.calledOnceWithExactly(
         response.setListThirdPartyDeveloperTools,
       );
+    });
+    it('closes the new tab and restores the selection when navigation fails', async () => {
+      const {
+        page: previousPage,
+        context,
+        response,
+        args,
+      } = createHandlerMocks();
+      const page = createMockMcpPage();
+      Object.defineProperty(page, 'id', {value: 2});
+      context.newPage.resolves(page);
+      const error = new Error('net::ERR_CONNECTION_REFUSED');
+      page.pptrPage.goto.rejects(error);
+
+      await assert.rejects(
+        newPage(args).handler(
+          {params: {url: 'https://example.com'}},
+          response,
+          context,
+        ),
+        error,
+      );
+
+      sinon.assert.calledOnceWithExactly(context.selectPage, previousPage);
+      sinon.assert.calledOnceWithExactly(context.closePage, 2);
+      sinon.assert.notCalled(response.setIncludePages);
+    });
+    it('rethrows the navigation error and lists pages when closing the tab fails', async () => {
+      const {
+        page: previousPage,
+        context,
+        response,
+        args,
+      } = createHandlerMocks();
+      const page = createMockMcpPage();
+      Object.defineProperty(page, 'id', {value: 2});
+      context.newPage.resolves(page);
+      const error = new Error('net::ERR_CONNECTION_REFUSED');
+      page.pptrPage.goto.rejects(error);
+      context.closePage.rejects(new Error('No page found'));
+
+      await assert.rejects(
+        newPage(args).handler(
+          {params: {url: 'https://example.com'}},
+          response,
+          context,
+        ),
+        error,
+      );
+
+      sinon.assert.calledOnceWithExactly(context.selectPage, previousPage);
+      sinon.assert.calledOnceWithExactly(response.setIncludePages, true);
+    });
+    it('keeps a dialog-blocked tab open and lists pages', async () => {
+      const {context, response, args} = createHandlerMocks();
+      const page = createMockMcpPage();
+      context.newPage.resolves(page);
+      const error = new Error('Navigation timeout of 1000 ms exceeded');
+      page.pptrPage.goto.rejects(error);
+      page.getDialog.returns(createMockDialog({message: 'blocked'}));
+
+      await assert.rejects(
+        newPage(args).handler(
+          {params: {url: 'https://example.com', timeout: 1000}},
+          response,
+          context,
+        ),
+        error,
+      );
+
+      sinon.assert.notCalled(context.selectPage);
+      sinon.assert.notCalled(context.closePage);
+      sinon.assert.calledOnceWithExactly(response.setIncludePages, true);
     });
     it('create a page', async () => {
       await withMcpContext(async (response, context, args) => {
@@ -775,7 +848,7 @@ describe('pages', () => {
 
       await selectPage(args).handler({params: {pageId: 1}}, response, context);
 
-      sinon.assert.calledOnceWithExactly(page.init);
+      sinon.assert.calledOnceWithExactly(page.init, {emulateFocus: true});
       sinon.assert.calledOnceWithExactly(context.selectPage, page);
       sinon.assert.calledOnceWithExactly(response.setIncludePages, true);
       sinon.assert.calledOnceWithExactly(
@@ -804,6 +877,7 @@ describe('pages', () => {
     });
     it('selects a page and keeps it focused in the background', async () => {
       await withMcpContext(async (response, context, args) => {
+        await context.getPageById(1).init();
         await context.newPage();
         assert.strictEqual(
           context.getPageById(2),
@@ -1207,11 +1281,9 @@ describe('pages', () => {
       const defaultTool = navigatePage(createMockParsedArguments());
       assert.strictEqual('initScript' in defaultTool.schema, true);
 
-      const disabledArgs = new ConfigParser(
-        '1.0.0',
-        ['node', 'script.js', '--no-javascript-evaluation'],
-        {CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS: 'true'},
-      ).parse();
+      const disabledArgs = createMockParsedArguments({
+        javascriptEvaluation: false,
+      });
       const disabledTool = navigatePage(disabledArgs);
       assert.strictEqual('initScript' in disabledTool.schema, false);
     });
@@ -1700,7 +1772,7 @@ describe('pages', () => {
         await evalPromise;
       });
     });
-    it('can dismiss already dismissed dialog dialogs', async () => {
+    it('throws when the dialog was already dismissed', async () => {
       await withMcpContext(async (response, context, args) => {
         const page = context.getSelectedMcpPage().pptrPage;
         const dialogPromise = new Promise<Dialog>(resolve => {
@@ -1713,20 +1785,19 @@ describe('pages', () => {
         });
         const dialog = await dialogPromise;
         await dialog.dismiss();
-        await handleDialog(args).handler(
-          {
-            params: {
-              action: 'dismiss',
-            },
-            page: context.getSelectedMcpPage(),
-          },
-          response,
-          context,
-        );
         assert.strictEqual(context.getSelectedMcpPage().getDialog(), undefined);
-        assert.strictEqual(
-          response.responseLines[0],
-          'Successfully dismissed the dialog',
+        await assert.rejects(
+          handleDialog(args).handler(
+            {
+              params: {
+                action: 'dismiss',
+              },
+              page: context.getSelectedMcpPage(),
+            },
+            response,
+            context,
+          ),
+          {message: 'No open dialog found'},
         );
         await evalPromise;
       });
