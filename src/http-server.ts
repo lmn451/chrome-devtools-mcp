@@ -472,7 +472,6 @@ export async function startMcpHttpServer(
   serverConfig: ServerConfig,
   options: McpHttpServerOptions,
 ): Promise<McpHttpServer> {
-  const serverArgs = serverConfig.resolved;
   validatePort(options.port);
   const maxSessions = resolvePositiveLimit(
     options.maxSessions,
@@ -490,7 +489,7 @@ export async function startMcpHttpServer(
     'sessionIdleTimeoutMs',
   );
 
-  const browserManager = new BrowserManager(serverArgs, {
+  const browserManager = new BrowserManager(serverConfig, {
     logFile: options.logFile,
   });
   const sessions = new Map<string, HttpSession>();

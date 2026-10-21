@@ -117,7 +117,7 @@ if (isProxyMode) {
   logDisclaimers(args);
 } else {
   stdioServer = await McpServer.from(serverConfig, {
-    browserManager: new BrowserManager(args, {logFile}),
+    browserManager: new BrowserManager(serverConfig, {logFile}),
     logFile,
   });
   const transport = new StdioServerTransport();

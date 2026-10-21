@@ -1393,6 +1393,14 @@ export class McpPage implements ContextPage {
     }
   }
 
+  clearNetworkConditions(): void {
+    if (!this.emulationSettings.networkConditions) {
+      return;
+    }
+    delete this.emulationSettings.networkConditions;
+    this.updateTimeouts();
+  }
+
   updateTimeouts(): void {
     if (!this.#pptrPage) {
       return;
@@ -1412,15 +1420,24 @@ export class McpPage implements ContextPage {
     );
   }
 
-  waitForTextOnPage(text: string[], timeout?: number): Promise<Element> {
+  waitForTextOnPage(
+    text: string[],
+    options: {timeout?: number; visible?: boolean} = {},
+  ): Promise<Element> {
+    const {timeout, visible} = options;
     const frames = this.pptrPage.frames();
 
     let locator = this.#locatorClass.race(
       frames.flatMap(frame =>
-        text.flatMap(value => [
-          frame.locator(`aria/${value}`),
-          frame.locator(`text/${value}`),
-        ]),
+        text.flatMap(value => {
+          const locators = [
+            frame.locator(`aria/${value}`),
+            frame.locator(`text/${value}`),
+          ];
+          return visible
+            ? locators.map(locator => locator.setVisibility('visible'))
+            : locators;
+        }),
       ),
     );
 

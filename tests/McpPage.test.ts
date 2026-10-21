@@ -994,6 +994,46 @@ describe('McpPage', () => {
     });
   });
 
+  describe('clearNetworkConditions()', () => {
+    it('clears networkConditions and updates timeouts while keeping other emulation settings', async () => {
+      const config = createMockServerConfig();
+      const {mcpPage, pptrPage} = await createMcpPage({config});
+      await mcpPage.emulate({
+        networkConditions: 'Slow 3G',
+        cpuThrottlingRate: 2,
+      });
+      pptrPage.setDefaultTimeout.resetHistory();
+      pptrPage.setDefaultNavigationTimeout.resetHistory();
+      config.commit(
+        createMockServerConfig({
+          blockedUrlPattern: ['https://example.com/*'],
+        }),
+      );
+
+      mcpPage.clearNetworkConditions();
+
+      assert.strictEqual(mcpPage.networkConditions, null);
+      assert.strictEqual(mcpPage.cpuThrottlingRate, 2);
+      sinon.assert.calledOnceWithExactly(pptrPage.setDefaultTimeout, 10_000);
+      sinon.assert.calledOnceWithExactly(
+        pptrPage.setDefaultNavigationTimeout,
+        20_000,
+      );
+      await mcpPage.restoreEmulation();
+    });
+
+    it('does nothing when networkConditions is not set', async () => {
+      const {mcpPage, pptrPage} = await createMcpPage();
+      pptrPage.setDefaultTimeout.resetHistory();
+      pptrPage.setDefaultNavigationTimeout.resetHistory();
+
+      mcpPage.clearNetworkConditions();
+
+      sinon.assert.notCalled(pptrPage.setDefaultTimeout);
+      sinon.assert.notCalled(pptrPage.setDefaultNavigationTimeout);
+    });
+  });
+
   describe('getNetworkRequests', () => {
     it('delegates to networkCollector.getData with includePreservedRequests', async () => {
       const {mcpPage} = await createMcpPage();
@@ -1152,6 +1192,72 @@ describe('McpPage', () => {
 
         const element = await mcpPage.waitForTextOnPage(['Hello iframe']);
         assert.ok(element);
+      });
+    });
+
+    it('preserves default matching for hidden DOM text', async () => {
+      await withMcpContext(async (_response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent(
+          '<p style="display:none">Saved successfully</p>',
+        );
+
+        const element = await mcpPage.waitForTextOnPage(
+          ['Saved successfully'],
+          {timeout: 500},
+        );
+        assert.ok(element);
+      });
+    });
+
+    it('waits for hidden text to become visible when requested', async () => {
+      await withMcpContext(async (_response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        const page = mcpPage.pptrPage;
+        await page.setContent(
+          '<p id="saved" style="display:none">Saved successfully</p>',
+        );
+
+        await page.evaluate(() => {
+          setTimeout(() => {
+            document.getElementById('saved')!.style.display = 'block';
+          }, 250);
+        });
+        const element = await mcpPage.waitForTextOnPage(
+          ['Saved successfully'],
+          {timeout: 1500, visible: true},
+        );
+        assert.ok(element);
+      });
+    });
+
+    it('times out when visible text never appears', async () => {
+      await withMcpContext(async (_response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent(
+          '<p style="display:none">Saved successfully</p>',
+        );
+
+        await assert.rejects(
+          mcpPage.waitForTextOnPage(['Saved successfully'], {
+            timeout: 300,
+            visible: true,
+          }),
+          /Timed out/,
+        );
+      });
+    });
+
+    it('visible text remains immediately matchable when requested', async () => {
+      await withMcpContext(async (_response, context) => {
+        const mcpPage = context.getSelectedMcpPage();
+        await mcpPage.pptrPage.setContent('<p>Visible from the start</p>');
+        assert.ok(
+          await mcpPage.waitForTextOnPage(['Visible from the start'], {
+            timeout: 500,
+            visible: true,
+          }),
+        );
       });
     });
   });
