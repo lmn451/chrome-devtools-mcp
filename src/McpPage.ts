@@ -22,6 +22,7 @@ import {
   PredefinedNetworkConditions,
   type Dialog,
   type ElementHandle,
+  type Frame,
   type Viewport,
   type WebMCPTool,
   type Protocol,
@@ -30,7 +31,11 @@ import {
   type ConsoleMessage,
   type HTTPRequest,
   DevTools,
+  type Flags,
   type JSONSchema7Definition,
+  lighthouseNavigation,
+  lighthouseSnapshot,
+  type RunnerResult,
 } from './third_party/index.js';
 import type {ToolGroups} from './tools/thirdPartyDeveloper.js';
 import type {
@@ -160,7 +165,7 @@ export class McpPage implements ContextPage {
 
   // Snapshot
   textSnapshot: TextSnapshot | null = null;
-  uniqueBackendNodeIdToMcpId = new Map<string, string>();
+  uniqueBackendNodeIdToMcpId: Map<string, string> = new Map<string, string>();
   extraHandles: ElementHandle[] = [];
 
   // Emulation
@@ -332,20 +337,26 @@ export class McpPage implements ContextPage {
       }
       this.#pptrPage = page;
       page.on('dialog', this.#dialogHandler);
-      this.#networkCollector = new NetworkCollector(page);
-      this.#consoleCollector = new ConsoleCollector(page, collect => {
-        return {
-          console: event => {
-            collect(event);
-          },
-          uncaughtError: event => {
-            collect(event);
-          },
-          devtoolsAggregatedIssue: event => {
-            collect(event);
-          },
-        };
+      this.#networkCollector = new NetworkCollector(page, {
+        maxNavigationSaved: this.#config.resolved.maxNavigationSaved,
       });
+      this.#consoleCollector = new ConsoleCollector(
+        page,
+        collect => {
+          return {
+            console: event => {
+              collect(event);
+            },
+            uncaughtError: event => {
+              collect(event);
+            },
+            devtoolsAggregatedIssue: event => {
+              collect(event);
+            },
+          };
+        },
+        {maxNavigationSaved: this.#config.resolved.maxNavigationSaved},
+      );
     }
     this.updateTimeouts();
     await this.#initDevToolsUniverseNoThrow();
@@ -1425,27 +1436,125 @@ export class McpPage implements ContextPage {
     options: {timeout?: number; visible?: boolean} = {},
   ): Promise<Element> {
     const {timeout, visible} = options;
-    const frames = this.pptrPage.frames();
+    const page = this.pptrPage;
+    const initialFrames = page.frames();
+    const observedFrames = new Set(initialFrames);
+    const controller = new AbortController();
 
-    let locator = this.#locatorClass.race(
-      frames.flatMap(frame =>
-        text.flatMap(value => {
-          const locators = [
-            frame.locator(`aria/${value}`),
-            frame.locator(`text/${value}`),
-          ];
-          return visible
-            ? locators.map(locator => locator.setVisibility('visible'))
-            : locators;
-        }),
-      ),
-    );
+    const locatorForFrames = (frames: Frame[]): Locator<Element> =>
+      this.#locatorClass.race(
+        frames.flatMap(frame =>
+          text.flatMap(value => {
+            const locators = [
+              frame.locator(`aria/${value}`),
+              frame.locator(`text/${value}`),
+            ];
+            return visible
+              ? locators.map(locator => locator.setVisibility('visible'))
+              : locators;
+          }),
+        ),
+      );
 
+    let initialLocator = locatorForFrames(initialFrames);
     if (timeout) {
-      locator = locator.setTimeout(timeout);
+      initialLocator = initialLocator.setTimeout(timeout);
     }
 
-    return locator.wait();
+    return new Promise<Element>((resolve, reject) => {
+      let settled = false;
+      const cleanup = (): boolean => {
+        if (settled) {
+          return false;
+        }
+        settled = true;
+        page.off('frameattached', onFrameAttached);
+        controller.abort();
+        return true;
+      };
+      const finish = (element: Element): void => {
+        if (cleanup()) {
+          resolve(element);
+        }
+      };
+      const fail = (error: unknown): void => {
+        if (cleanup()) {
+          reject(error);
+        }
+      };
+      const onFrameAttached = (frame: Frame): void => {
+        if (observedFrames.has(frame)) {
+          return;
+        }
+        observedFrames.add(frame);
+        // The initial locator race does not include frames added later.
+        // Watch each new frame until the initial race resolves or times out.
+        // A timeout of 0 disables the frame timer; controller.abort() stops it.
+        void locatorForFrames([frame])
+          .setTimeout(0)
+          .wait({signal: controller.signal})
+          .then(finish, error => {
+            if (controller.signal.aborted) {
+              return;
+            }
+            logger?.('Failed to wait for text in an attached frame', error);
+          });
+      };
+
+      page.on('frameattached', onFrameAttached);
+      void initialLocator.wait({signal: controller.signal}).then(finish, fail);
+    });
+  }
+
+  async resize(
+    width: number,
+    height: number,
+  ): Promise<{width: number; height: number} | undefined> {
+    try {
+      const browser = this.pptrPage.browser();
+      const windowId = await this.pptrPage.windowId();
+      const bounds = await browser.getWindowBounds(windowId);
+
+      if (bounds.windowState === 'fullscreen') {
+        // Have to call this twice on Ubuntu when the window is in fullscreen mode.
+        await browser.setWindowBounds(windowId, {windowState: 'normal'});
+        await browser.setWindowBounds(windowId, {windowState: 'normal'});
+      } else if (bounds.windowState !== 'normal') {
+        await browser.setWindowBounds(windowId, {windowState: 'normal'});
+      }
+    } catch {
+      // Window APIs are not supported on all platforms
+    }
+    await this.pptrPage.resize({
+      contentWidth: width,
+      contentHeight: height,
+    });
+
+    if (this.getDialog()) {
+      return undefined;
+    }
+
+    // @ts-expect-error internal API
+    const client = this.pptrPage._client();
+    const metrics: Protocol.Page.GetLayoutMetricsResponse = await client.send(
+      'Page.getLayoutMetrics',
+    );
+    return {
+      width: metrics.cssLayoutViewport.clientWidth,
+      height: metrics.cssLayoutViewport.clientHeight,
+    };
+  }
+
+  lighthouseNavigation(flags?: Flags): Promise<RunnerResult | undefined> {
+    return lighthouseNavigation(this.pptrPage, this.pptrPage.url(), {
+      flags,
+    });
+  }
+
+  lighthouseSnapshot(flags?: Flags): Promise<RunnerResult | undefined> {
+    return lighthouseSnapshot(this.pptrPage, {
+      flags,
+    });
   }
 
   /**
@@ -1455,7 +1564,7 @@ export class McpPage implements ContextPage {
     this.networkCollector.dispose();
     this.networkCollector = new NetworkCollector(
       this.pptrPage,
-      undefined,
+      {maxNavigationSaved: this.#config.resolved.maxNavigationSaved},
       collect => {
         return {
           request: req => {
