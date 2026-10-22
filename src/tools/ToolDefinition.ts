@@ -5,7 +5,7 @@
  */
 
 import {categoryToFlagName} from '../config/category-options.js';
-import type {ParsedArguments} from '../config/ConfigParser.js';
+import type {ParsedArguments} from '../config/mcp-options.js';
 import type {
   HeapSnapshotAggregateData,
   HeapSnapshotDiff,
@@ -21,25 +21,25 @@ import type {
   ContextFilterOptions,
   HeapSnapshotFormatOptions,
 } from '../formatters/HeapSnapshotFormatter.js';
-import {zod} from '../third_party/index.js';
-import type {
-  Dialog,
-  ElementHandle,
-  Extension,
-  GetPWAStateOptions,
-  InstallPWAOptions,
-  LaunchPWAOptions,
-  PWAState,
-  ScreenRecorder,
-  ScreenRecording,
-  UninstallPWAOptions,
-  Viewport,
-  DevTools,
-  Flags,
-  Protocol,
-  Page,
-  RunnerResult,
-  WebMCPTool,
+import {
+  zod,
+  type Dialog,
+  type ElementHandle,
+  type Extension,
+  type GetPWAStateOptions,
+  type InstallPWAOptions,
+  type LaunchPWAOptions,
+  type PWAState,
+  type ScreenRecorder,
+  type ScreenRecording,
+  type UninstallPWAOptions,
+  type Viewport,
+  type DevTools,
+  type Flags,
+  type Protocol,
+  type Page,
+  type RunnerResult,
+  type WebMCPTool,
 } from '../third_party/index.js';
 import type {InsightName, TraceResult} from '../processors/PerformanceTrace.js';
 import type {
@@ -122,12 +122,12 @@ export interface BaseToolDefinition<Schema extends ToolSchema = ToolSchema> {
   name: string;
   description: string;
   annotations: {
-    title?: string;
     category: ToolCategory;
     /**
      * If true, the tool does not modify its environment.
      */
     readOnlyHint: boolean;
+    title?: string;
     /**
      * If `'slim'` is included, the tool is only available with `--slim`. Tools
      * without `'slim'` are only available without `--slim`, see
@@ -211,7 +211,6 @@ export interface LighthouseData {
   summary: {
     mode: string;
     device: string;
-    url?: string;
     scores: Array<{
       id: string;
       title: string;
@@ -224,6 +223,7 @@ export interface LighthouseData {
     timing: {
       total: number;
     };
+    url?: string;
   };
   failedAudits: LighthouseFailedAudit[];
   reports: string[];

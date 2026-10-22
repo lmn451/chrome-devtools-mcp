@@ -9,12 +9,14 @@ import prettier from 'prettier';
 
 import type {Options as YargsOptions} from 'yargs';
 
-import {mcpOptions} from '../build/src/config/mcp-options.js';
+import {
+  mcpOptions,
+  type ParsedArguments,
+} from '../build/src/config/mcp-options.js';
 import {
   isCategoryOffByDefault,
   categoryToFlagName,
 } from '../build/src/config/category-options.js';
-import type {ParsedArguments} from '../build/src/config/ConfigParser.js';
 import {zod} from '../build/src/third_party/index.js';
 import {ToolCategory, labels} from '../build/src/tools/categories.js';
 import {isSlimTool} from '../build/src/tools/ToolDefinition.js';

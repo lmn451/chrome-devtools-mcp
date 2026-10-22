@@ -6,11 +6,11 @@
 
 import {AsyncLocalStorage} from 'node:async_hooks';
 
-import {DevTools} from '../third_party/index.js';
-import type {
-  CDPSession,
-  ConsoleMessage,
-  Protocol,
+import {
+  DevTools,
+  type CDPSession,
+  type ConsoleMessage,
+  type Protocol,
 } from '../third_party/index.js';
 
 import {McpHostBindingAdapter} from './McpHostBindingAdapter.js';
@@ -282,9 +282,9 @@ export class SymbolizedError {
   }
 
   static async fromDetails(opts: {
-    devTools?: TargetUniverse;
     details: ExceptionDetailsLike;
     targetId: string;
+    devTools?: TargetUniverse;
     // The session that reported `details`. Remote object ids are scoped to
     // the session that issued them, so the cause has to be resolved there.
     session?: CDPSession;
@@ -345,9 +345,9 @@ export class SymbolizedError {
   }
 
   static async fromError(opts: {
-    devTools?: TargetUniverse;
     error: RemoteObjectLike;
     targetId: string;
+    devTools?: TargetUniverse;
     session?: CDPSession;
   }): Promise<SymbolizedError> {
     const details = await SymbolizedError.#getExceptionDetails(

@@ -27,10 +27,8 @@ import './setupDevTools.js';
 import type {Frame, Mouse, SerializedAXNode} from 'puppeteer-core';
 import sinon from 'sinon';
 
-import {
-  type ParsedArguments,
-  ServerConfig,
-} from '../src/config/ServerConfig.js';
+import type {ParsedArguments} from '../src/config/mcp-options.js';
+import {ServerConfig} from '../src/config/ServerConfig.js';
 import {McpContext} from '../src/McpContext.js';
 import {McpPage} from '../src/McpPage.js';
 import {McpResponse} from '../src/McpResponse.js';
@@ -66,19 +64,17 @@ import {
   WebWorker,
   WebMCP,
   WebMCPTool,
-} from '../src/third_party/index.js';
-import type {
-  Browser,
-  BrowserContext,
-  ConsoleMessageLocation,
-  ConsoleMessageType,
-  Extension,
-  JSHandle,
-  Page,
-  Protocol,
-  Realm,
-  Result,
-  RunnerResult,
+  type Browser,
+  type BrowserContext,
+  type ConsoleMessageLocation,
+  type ConsoleMessageType,
+  type Extension,
+  type JSHandle,
+  type Page,
+  type Protocol,
+  type Realm,
+  type Result,
+  type RunnerResult,
 } from '../src/third_party/index.js';
 
 export type MockPuppeteerPage = sinon.SinonStubbedInstance<Page> & {
