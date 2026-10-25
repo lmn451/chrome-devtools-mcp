@@ -26,6 +26,7 @@ import * as slimTools from './slim/tools.js';
 import * as snapshotTools from './snapshot.js';
 import * as thirdPartyDeveloperTools from './thirdPartyDeveloper.js';
 import type {AnyToolDefinition} from './ToolDefinition.js';
+import * as webauthnTools from './webauthn.js';
 import * as webmcpTools from './webmcp.js';
 
 export const createTools = (args: ParsedArguments): AnyToolDefinition[] => {
@@ -48,6 +49,7 @@ export const createTools = (args: ParsedArguments): AnyToolDefinition[] => {
     ...Object.values(slimTools),
     ...Object.values(snapshotTools),
     ...Object.values(thirdPartyDeveloperTools),
+    ...Object.values(webauthnTools),
     ...Object.values(webmcpTools),
   ];
 

@@ -44,6 +44,8 @@ import type {
   MatchedStyles,
   Response,
   ScreenRecorderData,
+  WebAuthnAuthenticatorConfig,
+  WebAuthnAuthenticatorState,
 } from './tools/ToolDefinition.js';
 import type {
   EmulationSettings,
@@ -53,6 +55,7 @@ import type {
   PrefersReducedMotion,
   TextSnapshotNode,
 } from './types.js';
+import {getErrorMessage} from './utils/errorHandling.js';
 import {logger} from './utils/logger.js';
 import {
   getNetworkMultiplierFromString,
@@ -60,6 +63,31 @@ import {
   type WaitForEventsResult,
   type DialogAction,
 } from './utils/WaitForHelper.js';
+
+const WEBAUTHN_PROTOCOLS = {
+  ctap2: DevTools.Protocol.WebAuthn.AuthenticatorProtocol.Ctap2,
+  u2f: DevTools.Protocol.WebAuthn.AuthenticatorProtocol.U2f,
+};
+
+const WEBAUTHN_TRANSPORTS = {
+  internal: DevTools.Protocol.WebAuthn.AuthenticatorTransport.Internal,
+  usb: DevTools.Protocol.WebAuthn.AuthenticatorTransport.Usb,
+  nfc: DevTools.Protocol.WebAuthn.AuthenticatorTransport.Nfc,
+  ble: DevTools.Protocol.WebAuthn.AuthenticatorTransport.Ble,
+  hybrid: DevTools.Protocol.WebAuthn.AuthenticatorTransport.Hybrid,
+};
+
+interface WebAuthnAuthenticator {
+  id: DevTools.Protocol.WebAuthn.AuthenticatorId;
+  options: Omit<WebAuthnAuthenticatorState, 'credentials'>;
+}
+
+const WEBAUTHN_CREATION_OPTIONS = [
+  'protocol',
+  'transport',
+  'hasResidentKey',
+  'hasUserVerification',
+] as const;
 
 export function replaceHtmlElementsWithUids(
   schema: JSONSchema7Definition,
@@ -174,6 +202,8 @@ export class McpPage implements ContextPage {
   // Metadata
   isolatedContextName?: string;
   #devtoolsUniverse?: TargetUniverse;
+  #webAuthnEnabled = false;
+  #webAuthnAuthenticator?: WebAuthnAuthenticator;
 
   // Dialog
   #dialog?: Dialog;
@@ -426,6 +456,134 @@ export class McpPage implements ContextPage {
 
   get devtoolsUniverse(): TargetUniverse | undefined {
     return this.#devtoolsUniverse;
+  }
+
+  getWebAuthnAuthenticator():
+    Omit<WebAuthnAuthenticatorState, 'credentials'> | undefined {
+    return (
+      this.#webAuthnAuthenticator && {
+        ...this.#webAuthnAuthenticator.options,
+      }
+    );
+  }
+
+  async configureWebAuthn(
+    config: WebAuthnAuthenticatorConfig,
+  ): Promise<WebAuthnAuthenticatorState | undefined> {
+    const model = this.devtoolsUniverse?.target.model(
+      DevTools.WebAuthnModel.WebAuthnModel,
+    );
+    if (!model) {
+      throw new Error(`WebAuthn is not available for page ${this.id}.`);
+    }
+    const options = config.enabled
+      ? this.#resolveWebAuthnOptions(config)
+      : undefined;
+    try {
+      return await this.#applyWebAuthnConfig(model, options);
+    } catch (error) {
+      const orphan = this.#webAuthnAuthenticator;
+      this.#webAuthnEnabled = false;
+      this.#webAuthnAuthenticator = undefined;
+      if (orphan) {
+        try {
+          await model.removeAuthenticator(orphan.id);
+        } catch {
+          // Already gone, e.g. another client disabled the environment.
+        }
+      }
+      throw new Error(
+        `Failed to configure WebAuthn for page ${this.id}: ${getErrorMessage(error)}`,
+        {cause: error},
+      );
+    }
+  }
+
+  #resolveWebAuthnOptions(
+    config: WebAuthnAuthenticatorConfig,
+  ): WebAuthnAuthenticator['options'] {
+    const current = this.#webAuthnAuthenticator?.options;
+    const protocol = config.protocol ?? current?.protocol ?? 'ctap2';
+    const transport = config.transport ?? current?.transport ?? 'internal';
+    const isUserVerified =
+      config.isUserVerified ?? current?.isUserVerified ?? true;
+    if (protocol === 'u2f') {
+      if (config.hasResidentKey || config.hasUserVerification) {
+        throw new Error(
+          `protocol 'u2f' does not support hasResidentKey or hasUserVerification. Set them to false or omit them.`,
+        );
+      }
+      return {
+        protocol,
+        transport,
+        hasResidentKey: false,
+        hasUserVerification: false,
+        isUserVerified,
+      };
+    }
+    return {
+      protocol,
+      transport,
+      hasResidentKey: config.hasResidentKey ?? current?.hasResidentKey ?? true,
+      hasUserVerification:
+        config.hasUserVerification ?? current?.hasUserVerification ?? true,
+      isUserVerified,
+    };
+  }
+
+  async #applyWebAuthnConfig(
+    model: DevTools.WebAuthnModel.WebAuthnModel,
+    options: WebAuthnAuthenticator['options'] | undefined,
+  ): Promise<WebAuthnAuthenticatorState | undefined> {
+    if (!options) {
+      this.#webAuthnAuthenticator = undefined;
+      this.#webAuthnEnabled = false;
+      await model.setVirtualAuthEnvEnabled(false);
+      return undefined;
+    }
+    if (!this.#webAuthnEnabled) {
+      await model.setVirtualAuthEnvEnabled(true, false);
+      this.#webAuthnEnabled = true;
+    }
+
+    const current = this.#webAuthnAuthenticator;
+    let authenticator = current;
+    if (
+      !authenticator ||
+      WEBAUTHN_CREATION_OPTIONS.some(
+        key => options[key] !== authenticator?.options[key],
+      )
+    ) {
+      if (authenticator) {
+        await model.removeAuthenticator(authenticator.id);
+        this.#webAuthnAuthenticator = undefined;
+      }
+      const id = await model.addAuthenticator({
+        ...options,
+        protocol: WEBAUTHN_PROTOCOLS[options.protocol],
+        transport: WEBAUTHN_TRANSPORTS[options.transport],
+        automaticPresenceSimulation: true,
+      });
+      authenticator = {id, options};
+      this.#webAuthnAuthenticator = authenticator;
+    } else if (
+      options.isUserVerified !== authenticator.options.isUserVerified
+    ) {
+      await model.setUserVerified(authenticator.id, options.isUserVerified);
+      authenticator.options.isUserVerified = options.isUserVerified;
+    }
+
+    const credentials = await model.getCredentials(authenticator.id);
+    return {
+      ...authenticator.options,
+      credentials: credentials.map(credential => ({
+        credentialId: credential.credentialId,
+        rpId: credential.rpId,
+        isResidentCredential: credential.isResidentCredential,
+        userName: credential.userName,
+        signCount: credential.signCount,
+      })),
+    };
   }
 
   getDialog(): Dialog | undefined {
@@ -765,6 +923,7 @@ export class McpPage implements ContextPage {
     const initPromise = this.#initPromise;
     const devtoolsUniverse = this.#devtoolsUniverse;
     this.#devtoolsUniverse = undefined;
+    this.#webAuthnAuthenticator = undefined;
     devtoolsUniverse?.universe.dispose();
 
     this.#disposePromise = (async (): Promise<void> => {
@@ -1404,10 +1563,11 @@ export class McpPage implements ContextPage {
     }
   }
 
-  clearNetworkConditions(): void {
+  async clearNetworkConditions(): Promise<void> {
     if (!this.emulationSettings.networkConditions) {
       return;
     }
+    await this.#pptrPage?.emulateNetworkConditions(null);
     delete this.emulationSettings.networkConditions;
     this.updateTimeouts();
   }

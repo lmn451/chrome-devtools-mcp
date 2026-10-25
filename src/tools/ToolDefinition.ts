@@ -310,6 +310,9 @@ export interface Response {
     options?: {requestFilePath?: string; responseFilePath?: string},
   ): void;
   attachConsoleMessage(msgid: number): void;
+  attachWebAuthnAuthenticator(
+    authenticator: WebAuthnAuthenticatorState | undefined,
+  ): void;
   // Allows re-using DevTools data queried by some tools.
   attachDevToolsData(data: DevToolsData): void;
   setTabId(tabId: string): void;
@@ -465,6 +468,33 @@ export type BrowserlessContext = Readonly<{
 
 export type MatchedStyles = DevTools.CSSMatchedStyles.CSSMatchedStyles;
 
+export type WebAuthnProtocol = 'ctap2' | 'u2f';
+export type WebAuthnTransport = 'internal' | 'usb' | 'nfc' | 'ble' | 'hybrid';
+
+export interface WebAuthnAuthenticatorConfig {
+  enabled: boolean;
+  protocol?: WebAuthnProtocol;
+  transport?: WebAuthnTransport;
+  hasResidentKey?: boolean;
+  hasUserVerification?: boolean;
+  isUserVerified?: boolean;
+}
+
+export interface WebAuthnAuthenticatorState {
+  protocol: WebAuthnProtocol;
+  transport: WebAuthnTransport;
+  hasResidentKey: boolean;
+  hasUserVerification: boolean;
+  isUserVerified: boolean;
+  credentials: Array<{
+    credentialId: string;
+    rpId?: string;
+    isResidentCredential: boolean;
+    userName?: string;
+    signCount: number;
+  }>;
+}
+
 /**
  * Only add methods used by tools/*.
  */
@@ -477,6 +507,9 @@ export type ContextPage = Readonly<{
   getAXNodeByUid(uid: string): TextSnapshotNode | undefined;
   getElementByUid(uid: string): Promise<ElementHandle<Element>>;
   getMatchedStylesForUid(uid: string): Promise<MatchedStyles>;
+  configureWebAuthn(
+    config: WebAuthnAuthenticatorConfig,
+  ): Promise<WebAuthnAuthenticatorState | undefined>;
 
   /**
    * Returns a reqid for a cdpRequestId.

@@ -38,7 +38,7 @@ import {logger} from './utils/logger.js';
 import type {TaskQueue} from './utils/TaskRunner.js';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 import {isDeepStrictEqual} from 'node:util';
-import {isLocalhost} from './utils/url.js';
+import {isLocalBrowserEndpoint} from './utils/url.js';
 
 /**
  * Upper bound on how long a tool call may wait to acquire the browser
@@ -137,7 +137,7 @@ function isLocalBrowser(browser: Browser): boolean {
     return true;
   }
   const wsEndpoint = browser.wsEndpoint();
-  if (wsEndpoint && isLocalhost(wsEndpoint)) {
+  if (wsEndpoint && isLocalBrowserEndpoint(wsEndpoint)) {
     return true;
   }
   return false;
