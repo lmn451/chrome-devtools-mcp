@@ -58,6 +58,18 @@ import type {TraceResult} from './processors/PerformanceTrace.js';
 import type {Logger} from './types.js';
 import {McpWorker} from './McpWorker.js';
 import {getTempFilePath, resolveCanonicalPath} from './utils/files.js';
+import {
+  finishPageClose,
+  forgetPerformanceTrace,
+  isPageClosing,
+  isPerformanceTraceOwnedByAnotherSession,
+  PERFORMANCE_TRACE_CLOSE_BLOCKED_MESSAGE,
+  PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+  releasePerformanceTrace,
+  stopOwnedPerformanceTrace,
+  tryBeginPageClose,
+  withPerformanceTracePageLock,
+} from './utils/PerformanceTraceRegistry.js';
 import {escapeForLog} from './utils/logger.js';
 import type {TaskQueue, TaskRunner} from './utils/TaskRunner.js';
 import {isAllowedUrl} from './utils/url.js';
@@ -322,11 +334,35 @@ export class McpContext implements Context, BrowserlessContext {
       if (!mcpPage.isRunningPerformanceTrace()) {
         continue;
       }
-      mcpPage.setIsRunningPerformanceTrace(false);
+      let page: McpPage['pptrPage'];
       try {
-        await mcpPage.pptrPage.tracing.stop();
+        page = mcpPage.pptrPage;
       } catch (err) {
-        this.logger?.('Failed to stop the performance trace', err);
+        this.logger?.(
+          'Skipping performance trace cleanup for an uninitialized page',
+          err,
+        );
+        mcpPage.setIsRunningPerformanceTrace(false);
+        continue;
+      }
+      const stopped = await withPerformanceTracePageLock(page, async () => {
+        if (!mcpPage.isRunningPerformanceTrace()) {
+          return false;
+        }
+        try {
+          await stopOwnedPerformanceTrace(page, mcpPage, () =>
+            page.tracing.stop(),
+          );
+        } catch (err) {
+          this.logger?.('Failed to stop the performance trace', err);
+        } finally {
+          mcpPage.setIsRunningPerformanceTrace(false);
+          releasePerformanceTrace(page, mcpPage);
+        }
+        return true;
+      });
+      if (!stopped) {
+        continue;
       }
       this.logger?.(
         'The running performance trace was discarded because performance tools were disabled.',
@@ -462,25 +498,12 @@ export class McpContext implements Context, BrowserlessContext {
   #resetBrowserState(): Promise<void> | undefined {
     this.#browserGeneration++;
     const pages = this.#allMcpPages();
-    const activeTracePages = [...pages].filter(page =>
-      page.isRunningPerformanceTrace(),
-    );
 
     // Stop accepting browser events before starting any asynchronous cleanup.
     this.#browser?.off('targetcreated', this.#onTargetCreated);
     this.#browser?.off('targetdestroyed', this.#onTargetDestroyed);
 
     this.#serviceWorkerConsoleCollector?.dispose();
-    const cleanupTasks = activeTracePages.map(async page => {
-      try {
-        await page.pptrPage.tracing.stop();
-      } catch (error) {
-        this.logger?.(
-          'Failed to stop performance trace during context reset',
-          error,
-        );
-      }
-    });
     for (const mcpPage of pages) {
       this.#disposeMcpPage(mcpPage);
     }
@@ -499,7 +522,7 @@ export class McpContext implements Context, BrowserlessContext {
     this.#browser = undefined;
     this.#browserReady = undefined;
 
-    return this.#trackCleanup(cleanupTasks);
+    return this.#trackCleanup([]);
   }
 
   async dispose(options: {terminal?: boolean} = {}): Promise<void> {
@@ -530,6 +553,11 @@ export class McpContext implements Context, BrowserlessContext {
     try {
       const mcpPage = this.#mcpPages.get(target);
       if (mcpPage) {
+        try {
+          forgetPerformanceTrace(mcpPage.pptrPage);
+        } catch {
+          // The page may have been destroyed before it finished initializing.
+        }
         this.#disposeMcpPage(mcpPage);
         this.#mcpPages.delete(target);
       }
@@ -700,8 +728,31 @@ export class McpContext implements Context, BrowserlessContext {
     if (this.#mcpPages.size === 1) {
       throw new Error(CLOSE_PAGE_ERROR);
     }
-    this.#mcpPages.delete(page.target);
-    await page.close();
+    await page.init({emulateFocus: false});
+    const pptrPage = page.pptrPage;
+    await withPerformanceTracePageLock(pptrPage, async () => {
+      if (page.isClosed()) {
+        throw new Error(PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE);
+      }
+      if (isPageClosing(pptrPage)) {
+        throw new Error(PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE);
+      }
+      if (isPerformanceTraceOwnedByAnotherSession(pptrPage, page)) {
+        throw new Error(PERFORMANCE_TRACE_CLOSE_BLOCKED_MESSAGE);
+      }
+      if (!tryBeginPageClose(pptrPage, page)) {
+        throw new Error(PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE);
+      }
+    });
+    try {
+      if (this.#mcpPages.size === 1) {
+        throw new Error(CLOSE_PAGE_ERROR);
+      }
+      this.#mcpPages.delete(page.target);
+      await page.close();
+    } finally {
+      finishPageClose(pptrPage);
+    }
   }
 
   async installPWA(options: InstallPWAOptions): Promise<string> {
@@ -747,6 +798,13 @@ export class McpContext implements Context, BrowserlessContext {
       }
     }
     return false;
+  }
+
+  isPerformanceTraceEnabled(): boolean {
+    return isCapabilityEnabled(
+      {category: ToolCategory.PERFORMANCE},
+      this.#config.resolved,
+    );
   }
 
   isCruxEnabled(): boolean {

@@ -34,6 +34,10 @@ import {
   type ToolDefinition,
 } from './tools/ToolDefinition.js';
 import {getErrorMessage} from './utils/errorHandling.js';
+import {
+  getPageMutationBlockMessage,
+  withPerformanceTracePageLock,
+} from './utils/PerformanceTraceRegistry.js';
 import {logger} from './utils/logger.js';
 import type {TaskQueue} from './utils/TaskRunner.js';
 import {fileURLToPath, pathToFileURL} from 'node:url';
@@ -94,6 +98,24 @@ function getDisabledReason(
   }
 
   return undefined;
+}
+
+function shouldSerializePageMutation(tool: DefinedPageTool): boolean {
+  if (tool.annotations.readOnlyHint !== false) {
+    return false;
+  }
+  // These handlers acquire the shared-page gate themselves. Screenshots have
+  // a false read-only hint only because they may write a file; they do not
+  // mutate the traced page.
+  return ![
+    'navigate_page',
+    'navigate',
+    'evaluate',
+    'performance_start_trace',
+    'performance_stop_trace',
+    'screenshot',
+    'take_screenshot',
+  ].includes(tool.name);
 }
 
 async function validateAndResolvePathOrUrl(
@@ -402,23 +424,41 @@ export class ToolHandler {
       await validateToolFiles(tool, params, context, isLocalBrowser(browser));
       if (isPageScopedTool(tool)) {
         const pageId = routedPageId(tool, this.#config.resolved, params);
-        page =
+        const pageForTool =
           pageId !== undefined
             ? context.getPageById(pageId)
             : context.getSelectedMcpPage();
-        await page?.init({emulateFocus: true});
-        response.setPage(page);
+        page = pageForTool;
+        await pageForTool?.init({emulateFocus: true});
+        response.setPage(pageForTool);
         if (tool.blockedByDialog) {
-          page.throwIfDialogOpen();
+          pageForTool.throwIfDialogOpen();
         }
-        await tool.handler(
-          {
-            params,
-            page,
-          },
-          response,
-          context,
-        );
+        const runPageTool = async (): Promise<void> =>
+          await tool.handler(
+            {
+              params,
+              page: pageForTool,
+            },
+            response,
+            context,
+          );
+        if (shouldSerializePageMutation(tool) && pageForTool) {
+          const pptrPage = pageForTool.pptrPage;
+          await withPerformanceTracePageLock(pptrPage, async () => {
+            const blockMessage = getPageMutationBlockMessage(
+              pptrPage,
+              pageForTool,
+            );
+            if (blockMessage !== undefined) {
+              response.appendResponseLine(blockMessage);
+              return;
+            }
+            await runPageTool();
+          });
+        } else {
+          await runPageTool();
+        }
       } else {
         await tool.handler(
           {

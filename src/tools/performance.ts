@@ -14,6 +14,18 @@ import {
   type TraceResult,
 } from '../processors/PerformanceTrace.js';
 import {logger} from '../utils/logger.js';
+import {
+  markPerformanceTraceSetupComplete,
+  ownsPerformanceTrace,
+  PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE,
+  PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+  tryWithPerformanceTraceGlobalLock,
+  withPerformanceTracePageLock,
+  releasePerformanceTrace,
+  stopOwnedPerformanceTrace,
+  tryClaimPerformanceTrace,
+  isPageClosing,
+} from '../utils/PerformanceTraceRegistry.js';
 
 import {ToolCategory} from './categories.js';
 import {
@@ -23,6 +35,17 @@ import {
   type ContextPage,
   type PageToolFactory,
 } from './ToolDefinition.js';
+
+const performanceToolsDisabledMessage =
+  'Error: performance tools are disabled.';
+
+const performanceTraceAlreadyRunningMessage =
+  'Error: a performance trace is already running. Use performance_stop_trace to stop it. Only one trace can be running at any given time.';
+
+const pageClosedDuringTraceSetup = new Error('Page closed during trace setup');
+const performanceToolsDisabledDuringTraceSetup = new Error(
+  'Performance tools disabled during trace setup',
+);
 
 const filePathSchema = zod
   .string()
@@ -66,84 +89,174 @@ export const startTrace: PageToolFactory = definePageTool(() => ({
   },
   handler: async (request, response, context) => {
     const page = request.page;
-    if (context.isRunningPerformanceTrace()) {
-      response.appendResponseLine(
-        'Error: a performance trace is already running. Use performance_stop_trace to stop it. Only one trace can be running at any given time.',
-      );
-      return;
-    }
-    page.setIsRunningPerformanceTrace(true);
-
-    const pageUrlForTracing = page.pptrPage.url();
-
-    try {
-      if (request.params.reload) {
-        // Before starting the recording, navigate to about:blank to clear out any state.
-        // We use `load` because `networkidle0` is known to be flaky for about:blank in Puppeteer.
-        await page.pptrPage.goto('about:blank', {
-          waitUntil: 'load',
-        });
+    const pptrPage = page.pptrPage;
+    const started = await withPerformanceTracePageLock(pptrPage, async () => {
+      if (page.isClosed() || isPageClosing(pptrPage)) {
+        response.appendResponseLine(PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE);
+        return false;
+      }
+      if (!context.isPerformanceTraceEnabled()) {
+        response.appendResponseLine(performanceToolsDisabledMessage);
+        return false;
+      }
+      if (context.isRunningPerformanceTrace()) {
+        response.appendResponseLine(performanceTraceAlreadyRunningMessage);
+        return false;
       }
 
-      const categories = [
-        '-*',
-        ...DevTools.TracingDefaultCategories,
-        // These categories are optional in DevTools, but enabled by default in the DevTools UI, so we enable them here too.
-        ...DevTools.TracingOptionalCategories.JsSampling,
-        ...DevTools.TracingOptionalCategories.Screenshot,
-      ];
-      await page.pptrPage.tracing.start({
-        categories,
-        bufferSize: 1200 * 1000,
-      });
+      const traceClaim = tryWithPerformanceTraceGlobalLock(() =>
+        tryClaimPerformanceTrace(pptrPage, page, {setupPending: true}),
+      );
+      if (!traceClaim.acquired) {
+        response.appendResponseLine(PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE);
+        return false;
+      }
+      if (!traceClaim.value) {
+        response.appendResponseLine(performanceTraceAlreadyRunningMessage);
+        return false;
+      }
 
-      if (request.params.reload) {
-        const ignoreCache = request.params.ignoreCache ?? false;
-        if (ignoreCache) {
-          // Disable the HTTP cache so that the main document and all
-          // subresources are fetched from the network, like a hard reload.
-          await page.pptrPage.setCacheEnabled(false);
+      let traceStartedByThisCall = false;
+      let cacheDisabled = false;
+      let blankPageNavigated = false;
+      const pageUrlForTracing = pptrPage.url();
+      const ensureTraceSetupCanContinue = (): void => {
+        if (page.isClosed()) {
+          throw pageClosedDuringTraceSetup;
         }
-        try {
-          await page.pptrPage.goto(pageUrlForTracing, {
-            waitUntil: ['load'],
+        if (!context.isPerformanceTraceEnabled()) {
+          throw performanceToolsDisabledDuringTraceSetup;
+        }
+      };
+      try {
+        page.setIsRunningPerformanceTrace(true);
+        if (request.params.reload) {
+          // Before starting the recording, navigate to about:blank to clear out any state.
+          // We use `load` because `networkidle0` is known to be flaky for about:blank in Puppeteer.
+          ensureTraceSetupCanContinue();
+          await pptrPage.goto('about:blank', {
+            waitUntil: 'load',
           });
-        } finally {
-          if (ignoreCache) {
-            await page.pptrPage.setCacheEnabled(true);
+          blankPageNavigated = true;
+          ensureTraceSetupCanContinue();
+        }
+
+        const categories = [
+          '-*',
+          ...DevTools.TracingDefaultCategories,
+          // These categories are optional in DevTools, but enabled by default in the DevTools UI, so we enable them here too.
+          ...DevTools.TracingOptionalCategories.JsSampling,
+          ...DevTools.TracingOptionalCategories.Screenshot,
+        ];
+        ensureTraceSetupCanContinue();
+        await pptrPage.tracing.start({
+          categories,
+          bufferSize: 1200 * 1000,
+        });
+        traceStartedByThisCall = true;
+        ensureTraceSetupCanContinue();
+
+        if (request.params.reload) {
+          const ignoreCache = request.params.ignoreCache ?? false;
+          try {
+            if (ignoreCache) {
+              // Disable the HTTP cache so that the main document and all
+              // subresources are fetched from the network, like a hard reload.
+              ensureTraceSetupCanContinue();
+              await pptrPage.setCacheEnabled(false);
+              cacheDisabled = true;
+            }
+            ensureTraceSetupCanContinue();
+            await pptrPage.goto(pageUrlForTracing, {
+              waitUntil: ['load'],
+            });
+            ensureTraceSetupCanContinue();
+          } finally {
+            if (cacheDisabled) {
+              await pptrPage.setCacheEnabled(true);
+              cacheDisabled = false;
+            }
           }
         }
-      }
 
-      if (request.params.autoStop) {
-        await new Promise(resolve => setTimeout(resolve, 5_000));
-        await stopTracingAndAppendOutput(
-          page,
-          response,
-          context,
-          request.params.filePath,
-        );
-      } else {
-        response.appendResponseLine(
-          `The performance trace is being recorded. Use performance_stop_trace to stop it.`,
-        );
-      }
-    } catch (error) {
-      // If a setup step (navigation, tracing.start) throws before
-      // stopTracingAndAppendOutput runs, the running flag would otherwise stay
-      // stuck `true` for the rest of the session, blocking all future traces.
-      // Unwind here: stop tracing if it was started and clear the flag. When
-      // autoStop already ran stopTracingAndAppendOutput the flag is already
-      // false and this is a no-op.
-      if (page.isRunningPerformanceTrace()) {
-        try {
-          await page.pptrPage.tracing.stop();
-        } catch {
-          // Tracing may not have started yet; ignore.
+        ensureTraceSetupCanContinue();
+        markPerformanceTraceSetupComplete(pptrPage, page);
+        return true;
+      } catch (error) {
+        markPerformanceTraceSetupComplete(pptrPage, page);
+        // Only stop a trace that this call successfully started and still owns.
+        // A failed start on a shared Puppeteer Page must not stop another session's trace.
+        if (traceStartedByThisCall && ownsPerformanceTrace(pptrPage, page)) {
+          try {
+            await stopOwnedPerformanceTrace(pptrPage, page, () =>
+              pptrPage.tracing.stop(),
+            );
+          } catch {
+            // Tracing may already have stopped; ignore cleanup errors.
+          }
         }
-        page.setIsRunningPerformanceTrace(false);
+        try {
+          page.setIsRunningPerformanceTrace(false);
+        } finally {
+          try {
+            if (
+              error === performanceToolsDisabledDuringTraceSetup &&
+              blankPageNavigated &&
+              !page.isClosed() &&
+              pptrPage.url() !== pageUrlForTracing
+            ) {
+              try {
+                await pptrPage.goto(pageUrlForTracing, {
+                  waitUntil: ['load'],
+                });
+              } catch (restoreError) {
+                logger?.(
+                  'Failed to restore page URL after performance trace setup was canceled: %s',
+                  restoreError,
+                );
+              }
+            }
+          } finally {
+            releasePerformanceTrace(pptrPage, page);
+          }
+        }
+        if (error === pageClosedDuringTraceSetup) {
+          response.appendResponseLine(PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE);
+          return false;
+        }
+        if (error === performanceToolsDisabledDuringTraceSetup) {
+          response.appendResponseLine(performanceToolsDisabledMessage);
+          return false;
+        }
+        throw error;
+      } finally {
+        markPerformanceTraceSetupComplete(pptrPage, page);
       }
-      throw error;
+    });
+
+    if (!started || page.isClosed() || !ownsPerformanceTrace(pptrPage, page)) {
+      return;
+    }
+
+    if (request.params.autoStop) {
+      await new Promise(resolve => setTimeout(resolve, 5_000));
+      if (page.isClosed() || !ownsPerformanceTrace(pptrPage, page)) {
+        return;
+      }
+      await withPerformanceTracePageLock(pptrPage, async () => {
+        if (!page.isClosed() && ownsPerformanceTrace(pptrPage, page)) {
+          await stopTracingAndAppendOutput(
+            page,
+            response,
+            context,
+            request.params.filePath,
+          );
+        }
+      });
+    } else {
+      response.appendResponseLine(
+        `The performance trace is being recorded. Use performance_stop_trace to stop it.`,
+      );
     }
   },
 }));
@@ -166,18 +279,20 @@ export const stopTrace: PageToolFactory = definePageTool(() => ({
   },
   handler: async (request, response, context) => {
     const page = request.page;
-    if (!page.isRunningPerformanceTrace()) {
-      response.appendResponseLine(
-        'Error: no active performance trace recording to stop.',
+    await withPerformanceTracePageLock(page.pptrPage, async () => {
+      if (!page.isRunningPerformanceTrace()) {
+        response.appendResponseLine(
+          'Error: no active performance trace recording to stop.',
+        );
+        return;
+      }
+      await stopTracingAndAppendOutput(
+        page,
+        response,
+        context,
+        request.params.filePath,
       );
-      return;
-    }
-    await stopTracingAndAppendOutput(
-      page,
-      response,
-      context,
-      request.params.filePath,
-    );
+    });
   },
 }));
 
@@ -228,7 +343,12 @@ async function stopTracingAndAppendOutput(
   filePath?: string,
 ): Promise<void> {
   try {
-    const traceEventsBuffer = await page.pptrPage.tracing.stop();
+    const pptrPage = page.pptrPage;
+    const traceEventsBuffer = await stopOwnedPerformanceTrace(
+      pptrPage,
+      page,
+      () => pptrPage.tracing.stop(),
+    );
     if (filePath && traceEventsBuffer) {
       let dataToWrite: Uint8Array = traceEventsBuffer;
       if (filePath.endsWith('.gz')) {
@@ -268,7 +388,11 @@ async function stopTracingAndAppendOutput(
       );
     }
   } finally {
-    page.setIsRunningPerformanceTrace(false);
+    try {
+      page.setIsRunningPerformanceTrace(false);
+    } finally {
+      releasePerformanceTrace(page.pptrPage, page);
+    }
   }
 }
 

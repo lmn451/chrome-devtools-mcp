@@ -6,6 +6,12 @@
 
 import type {ParsedArguments} from '../config/mcp-options.js';
 import {zod, type CdpPage} from '../third_party/index.js';
+import {
+  getPageMutationBlockMessage,
+  PERFORMANCE_TRACE_CLOSE_BLOCKED_MESSAGE,
+  PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+  withPerformanceTracePageLock,
+} from '../utils/PerformanceTraceRegistry.js';
 import {logger} from '../utils/logger.js';
 import {validateUrl} from '../utils/url.js';
 
@@ -93,7 +99,11 @@ export const closePage: ToolFactory = defineTool(() => ({
     try {
       await context.closePage(request.params.pageId);
     } catch (err) {
-      if (err.message === CLOSE_PAGE_ERROR) {
+      if (
+        err.message === CLOSE_PAGE_ERROR ||
+        err.message === PERFORMANCE_TRACE_CLOSE_BLOCKED_MESSAGE ||
+        err.message === PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE
+      ) {
         response.appendResponseLine(err.message);
       } else {
         throw err;
@@ -253,97 +263,105 @@ export const navigatePage: PageToolFactory = definePageTool(
           });
         }
 
-        let initScriptId: string | undefined;
-        if (request.params.initScript) {
-          const {identifier} = await page.pptrPage.evaluateOnNewDocument(
-            request.params.initScript,
-          );
-          initScriptId = identifier;
-        }
+        await withPerformanceTracePageLock(page.pptrPage, async () => {
+          const blockMessage = getPageMutationBlockMessage(page.pptrPage, page);
+          if (blockMessage !== undefined) {
+            response.appendResponseLine(blockMessage);
+            return;
+          }
 
-        try {
-          const action = request.params.handleBeforeUnload ?? 'accept';
-          const result = await page.waitForEventsAfterAction(
-            async () => {
-              switch (request.params.type) {
-                case 'url':
-                  if (!request.params.url) {
-                    throw new Error(
-                      'A URL is required for navigation of type=url.',
-                    );
-                  }
-                  try {
-                    await page.pptrPage.goto(request.params.url, options);
-                    response.appendResponseLine(
-                      `Successfully navigated to ${request.params.url}.`,
-                    );
-                  } catch (error) {
-                    response.appendResponseLine(
-                      `Unable to navigate in the selected page: ${error.message}.`,
-                    );
-                  }
-                  break;
-                case 'back':
-                  try {
-                    await page.pptrPage.goBack(options);
-                    response.appendResponseLine(
-                      `Successfully navigated back to ${page.pptrPage.url()}.`,
-                    );
-                  } catch (error) {
-                    response.appendResponseLine(
-                      `Unable to navigate back in the selected page: ${error.message}.`,
-                    );
-                  }
-                  break;
-                case 'forward':
-                  try {
-                    await page.pptrPage.goForward(options);
-                    response.appendResponseLine(
-                      `Successfully navigated forward to ${page.pptrPage.url()}.`,
-                    );
-                  } catch (error) {
-                    response.appendResponseLine(
-                      `Unable to navigate forward in the selected page: ${error.message}.`,
-                    );
-                  }
-                  break;
-                case 'reload':
-                  try {
-                    await page.pptrPage.reload({
-                      ...options,
-                      ignoreCache: request.params.ignoreCache,
-                    });
-                    response.appendResponseLine(
-                      `Successfully reloaded the page.`,
-                    );
-                  } catch (error) {
-                    response.appendResponseLine(
-                      `Unable to reload the selected page: ${error.message}.`,
-                    );
-                  }
-                  break;
-              }
-            },
-            {
-              timeout: request.params.timeout,
-              handleDialog: {beforeunload: action},
-            },
-          );
-          if (result.dialogHandled) {
-            response.appendResponseLine(
-              `${action === 'dismiss' ? 'Dismissed' : 'Accepted'} a beforeunload dialog.`,
+          let initScriptId: string | undefined;
+          if (request.params.initScript) {
+            const {identifier} = await page.pptrPage.evaluateOnNewDocument(
+              request.params.initScript,
             );
-            page.clearDialog();
+            initScriptId = identifier;
           }
-        } finally {
-          if (initScriptId) {
-            await page.pptrPage
-              .removeScriptToEvaluateOnNewDocument(initScriptId)
-              .catch(error => {
-                logger?.(`Failed to remove init script`, error);
-              });
+
+          try {
+            const action = request.params.handleBeforeUnload ?? 'accept';
+            const result = await page.waitForEventsAfterAction(
+              async () => {
+                switch (request.params.type) {
+                  case 'url':
+                    if (!request.params.url) {
+                      throw new Error(
+                        'A URL is required for navigation of type=url.',
+                      );
+                    }
+                    try {
+                      await page.pptrPage.goto(request.params.url, options);
+                      response.appendResponseLine(
+                        `Successfully navigated to ${request.params.url}.`,
+                      );
+                    } catch (error) {
+                      response.appendResponseLine(
+                        `Unable to navigate in the selected page: ${error.message}.`,
+                      );
+                    }
+                    break;
+                  case 'back':
+                    try {
+                      await page.pptrPage.goBack(options);
+                      response.appendResponseLine(
+                        `Successfully navigated back to ${page.pptrPage.url()}.`,
+                      );
+                    } catch (error) {
+                      response.appendResponseLine(
+                        `Unable to navigate back in the selected page: ${error.message}.`,
+                      );
+                    }
+                    break;
+                  case 'forward':
+                    try {
+                      await page.pptrPage.goForward(options);
+                      response.appendResponseLine(
+                        `Successfully navigated forward to ${page.pptrPage.url()}.`,
+                      );
+                    } catch (error) {
+                      response.appendResponseLine(
+                        `Unable to navigate forward in the selected page: ${error.message}.`,
+                      );
+                    }
+                    break;
+                  case 'reload':
+                    try {
+                      await page.pptrPage.reload({
+                        ...options,
+                        ignoreCache: request.params.ignoreCache,
+                      });
+                      response.appendResponseLine(
+                        `Successfully reloaded the page.`,
+                      );
+                    } catch (error) {
+                      response.appendResponseLine(
+                        `Unable to reload the selected page: ${error.message}.`,
+                      );
+                    }
+                    break;
+                }
+              },
+              {
+                timeout: request.params.timeout,
+                handleDialog: {beforeunload: action},
+              },
+            );
+            if (result.dialogHandled) {
+              response.appendResponseLine(
+                `${action === 'dismiss' ? 'Dismissed' : 'Accepted'} a beforeunload dialog.`,
+              );
+              page.clearDialog();
+            }
+          } finally {
+            if (initScriptId) {
+              await page.pptrPage
+                .removeScriptToEvaluateOnNewDocument(initScriptId)
+                .catch(error => {
+                  logger?.(`Failed to remove init script`, error);
+                });
+            }
           }
-        }
+        });
 
         response.setIncludePages(true);
         response.setListThirdPartyDeveloperTools();

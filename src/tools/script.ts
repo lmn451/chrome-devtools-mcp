@@ -14,6 +14,12 @@ import {
   type Page,
   type WebWorker,
 } from '../third_party/index.js';
+import {
+  getPageMutationBlockMessage,
+  hasActivePerformanceTrace,
+  withPerformanceTraceGlobalLock,
+  withPerformanceTracePageLock,
+} from '../utils/PerformanceTraceRegistry.js';
 
 import {ToolCategory} from './categories.js';
 import {
@@ -25,6 +31,9 @@ import {
 } from './ToolDefinition.js';
 
 export type Evaluatable = Page | Frame | WebWorker;
+
+const serviceWorkerTraceConflictMessage =
+  'Error: service-worker evaluation is blocked while a performance trace is active because it may navigate a traced tab.';
 
 export const evaluateScript: ToolFactory = defineTool(
   (cliArgs: ParsedArguments) => {
@@ -148,22 +157,38 @@ Example with arguments: \`(el) => el.innerText\`
           }
 
           const worker = await getWebWorker(context, serviceWorkerId);
-          const result = await context
-            .getSelectedMcpPage()
-            .waitForEventsAfterAction(
-              async () => {
-                await performEvaluation(worker, source, format, [], response, {
-                  filePath,
-                  context,
-                });
-              },
-              // Service workers cannot interact with the DOM, so never wait for it.
-              {handleDialog: dialogAction ?? 'accept', waitForStableDom: false},
-            );
-          if (result.dialogHandled) {
-            context.getSelectedMcpPage().clearDialog();
-          }
-          response.attachWaitForResult(result);
+          await withPerformanceTraceGlobalLock(async () => {
+            if (hasActivePerformanceTrace()) {
+              response.appendResponseLine(serviceWorkerTraceConflictMessage);
+              return;
+            }
+            const result = await context
+              .getSelectedMcpPage()
+              .waitForEventsAfterAction(
+                async () => {
+                  await performEvaluation(
+                    worker,
+                    source,
+                    format,
+                    [],
+                    response,
+                    {
+                      filePath,
+                      context,
+                    },
+                  );
+                },
+                // Service workers cannot interact with the DOM, so never wait for it.
+                {
+                  handleDialog: dialogAction ?? 'accept',
+                  waitForStableDom: false,
+                },
+              );
+            if (result.dialogHandled) {
+              context.getSelectedMcpPage().clearDialog();
+            }
+            response.attachWaitForResult(result);
+          });
           return;
         }
 
@@ -184,36 +209,44 @@ Example with arguments: \`(el) => el.innerText\`
         mcpPage.throwIfDialogOpen();
         const page: Page = mcpPage.pptrPage;
 
-        const args: Array<JSHandle<unknown>> = [];
-        using stack = new DisposableStack();
+        await withPerformanceTracePageLock(page, async () => {
+          const blockMessage = getPageMutationBlockMessage(page, mcpPage);
+          if (blockMessage !== undefined) {
+            response.appendResponseLine(blockMessage);
+            return;
+          }
 
-        const frames = new Set<Frame>();
-        for (const uid of uidArgs ?? []) {
-          const handle = await mcpPage.getElementByUid(uid);
-          frames.add(handle.frame);
-          stack.use(handle);
-          args.push(handle);
-        }
+          const args: Array<JSHandle<unknown>> = [];
+          using stack = new DisposableStack();
 
-        const evaluatable = await getPageOrFrame(page, frames);
+          const frames = new Set<Frame>();
+          for (const uid of uidArgs ?? []) {
+            const handle = await mcpPage.getElementByUid(uid);
+            frames.add(handle.frame);
+            stack.use(handle);
+            args.push(handle);
+          }
 
-        const result = await mcpPage.waitForEventsAfterAction(
-          async () => {
-            await performEvaluation(
-              evaluatable,
-              source,
-              format,
-              args,
-              response,
-              {
-                filePath,
-                context,
-              },
-            );
-          },
-          {handleDialog: dialogAction ?? 'accept', waitForStableDom},
-        );
-        response.attachWaitForResult(result);
+          const evaluatable = await getPageOrFrame(page, frames);
+
+          const result = await mcpPage.waitForEventsAfterAction(
+            async () => {
+              await performEvaluation(
+                evaluatable,
+                source,
+                format,
+                args,
+                response,
+                {
+                  filePath,
+                  context,
+                },
+              );
+            },
+            {handleDialog: dialogAction ?? 'accept', waitForStableDom},
+          );
+          response.attachWaitForResult(result);
+        });
       },
     };
   },

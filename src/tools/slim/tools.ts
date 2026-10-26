@@ -8,6 +8,10 @@ import type {ParsedArguments} from '../../config/mcp-options.js';
 import {zod, type Dialog} from '../../third_party/index.js';
 import {ToolCategory} from '../categories.js';
 import {definePageTool, type PageToolFactory} from '../ToolDefinition.js';
+import {
+  getPageMutationBlockMessage,
+  withPerformanceTracePageLock,
+} from '../../utils/PerformanceTraceRegistry.js';
 import {validateUrl} from '../../utils/url.js';
 
 export const screenshot: PageToolFactory = definePageTool(() => ({
@@ -79,28 +83,35 @@ export const navigate: PageToolFactory = definePageTool(
         });
 
         const page = request.page;
-
-        const options = {
-          timeout: 30_000,
-        };
-
-        const dialogHandler = (dialog: Dialog): void => {
-          if (dialog.type() === 'beforeunload') {
-            response.appendResponseLine(`Accepted a beforeunload dialog.`);
-            void dialog.accept();
-            // We are not going to report the dialog like regular dialogs.
-            page.clearDialog();
+        await withPerformanceTracePageLock(page.pptrPage, async () => {
+          const blockMessage = getPageMutationBlockMessage(page.pptrPage, page);
+          if (blockMessage !== undefined) {
+            response.appendResponseLine(blockMessage);
+            return;
           }
-        };
 
-        page.pptrPage.on('dialog', dialogHandler);
+          const options = {
+            timeout: 30_000,
+          };
 
-        try {
-          await page.pptrPage.goto(request.params.url, options);
-          response.appendResponseLine(`Navigated to ${page.pptrPage.url()}.`);
-        } finally {
-          page.pptrPage.off('dialog', dialogHandler);
-        }
+          const dialogHandler = (dialog: Dialog): void => {
+            if (dialog.type() === 'beforeunload') {
+              response.appendResponseLine(`Accepted a beforeunload dialog.`);
+              void dialog.accept();
+              // We are not going to report the dialog like regular dialogs.
+              page.clearDialog();
+            }
+          };
+
+          page.pptrPage.on('dialog', dialogHandler);
+
+          try {
+            await page.pptrPage.goto(request.params.url, options);
+            response.appendResponseLine(`Navigated to ${page.pptrPage.url()}.`);
+          } finally {
+            page.pptrPage.off('dialog', dialogHandler);
+          }
+        });
       },
     };
   },
@@ -122,7 +133,14 @@ export const evaluate: PageToolFactory = definePageTool(() => ({
   verifyFilesSchema: {},
   handler: async (request, response) => {
     const page = request.page;
-    const result = await page.pptrPage.evaluate(request.params.script);
-    response.appendResponseLine(JSON.stringify(result));
+    await withPerformanceTracePageLock(page.pptrPage, async () => {
+      const blockMessage = getPageMutationBlockMessage(page.pptrPage, page);
+      if (blockMessage !== undefined) {
+        response.appendResponseLine(blockMessage);
+        return;
+      }
+      const result = await page.pptrPage.evaluate(request.params.script);
+      response.appendResponseLine(JSON.stringify(result));
+    });
   },
 }));

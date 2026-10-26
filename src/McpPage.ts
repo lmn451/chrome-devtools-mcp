@@ -56,6 +56,12 @@ import type {
   TextSnapshotNode,
 } from './types.js';
 import {getErrorMessage} from './utils/errorHandling.js';
+import {
+  ownsPerformanceTrace,
+  releasePerformanceTrace,
+  stopOwnedPerformanceTrace,
+  withPerformanceTracePageLock,
+} from './utils/PerformanceTraceRegistry.js';
 import {logger} from './utils/logger.js';
 import {
   getNetworkMultiplierFromString,
@@ -312,13 +318,13 @@ export class McpPage implements ContextPage {
   }
 
   isClosed(): boolean {
-    if (this.#closed) {
+    if (this.#disposed || this.#closed) {
       return true;
     }
     if (this.#pptrPage) {
       return this.#pptrPage.isClosed();
     }
-    return this.#disposed;
+    return false;
   }
 
   async close(): Promise<void> {
@@ -910,7 +916,7 @@ export class McpPage implements ContextPage {
     }
 
     // Mark and detach synchronously before the first await so no more events
-    // are accepted while asynchronous recorder/session cleanup is in flight.
+    // are accepted while asynchronous trace/recorder/session cleanup is in flight.
     this.#disposed = true;
     this.#isRunningPerformanceTrace = false;
     this.disposeCommentBridge();
@@ -918,6 +924,7 @@ export class McpPage implements ContextPage {
     this.#networkCollector?.dispose();
     this.#consoleCollector?.dispose();
 
+    const pptrPage = this.#pptrPage;
     const recorder = this.#screenRecorder?.recorder;
     this.#screenRecorder = null;
     const initPromise = this.#initPromise;
@@ -927,6 +934,20 @@ export class McpPage implements ContextPage {
     devtoolsUniverse?.universe.dispose();
 
     this.#disposePromise = (async (): Promise<void> => {
+      if (pptrPage) {
+        await withPerformanceTracePageLock(pptrPage, async () => {
+          if (ownsPerformanceTrace(pptrPage, this)) {
+            try {
+              await stopOwnedPerformanceTrace(pptrPage, this, () =>
+                pptrPage.tracing.stop(),
+              );
+            } catch (e) {
+              logger?.('Failed to stop performance trace on page dispose', e);
+            }
+          }
+          releasePerformanceTrace(pptrPage, this);
+        });
+      }
       if (initPromise) {
         try {
           await initPromise;
