@@ -12,7 +12,17 @@ import {describe, it} from 'node:test';
 import sinon from 'sinon';
 
 import {evaluate, navigate, screenshot} from '../../../src/tools/slim/tools.js';
-import {createHandlerMocks, createMockParsedArguments} from '../../mocks.js';
+import {startTrace} from '../../../src/tools/performance.js';
+import {
+  PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+  releasePerformanceTrace,
+  tryClaimPerformanceTrace,
+} from '../../../src/utils/PerformanceTraceRegistry.js';
+import {
+  createHandlerMocks,
+  createMockMcpPage,
+  createMockParsedArguments,
+} from '../../mocks.js';
 import {screenshots} from '../../snapshot.js';
 import {withMcpContext, createTempDir} from '../../utils.js';
 
@@ -26,6 +36,31 @@ describe('slim', () => {
 
     sinon.assert.calledOnceWithExactly(page.pptrPage.evaluate, script);
     sinon.assert.calledOnceWithExactly(response.appendResponseLine, '10');
+  });
+
+  it('rejects evaluation while another session traces the shared page', async () => {
+    const {page, context, response, args} = createHandlerMocks();
+    const traceOwner = {};
+    assert.ok(tryClaimPerformanceTrace(page.pptrPage, traceOwner));
+
+    try {
+      await evaluate(args).handler(
+        {
+          params: {script: 'window.location.href = "https://example.com"'},
+          page,
+        },
+        response,
+        context,
+      );
+
+      sinon.assert.notCalled(page.pptrPage.evaluate);
+      sinon.assert.calledOnceWithExactly(
+        response.appendResponseLine,
+        PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+      );
+    } finally {
+      releasePerformanceTrace(page.pptrPage, traceOwner);
+    }
   });
 
   it('propagates evaluation errors for response handling', async () => {
@@ -60,6 +95,70 @@ describe('slim', () => {
       assert(!response.includePages);
       t.assert.snapshot(response.responseLines.join('\n'));
     });
+  });
+
+  it('does not navigate a shared page traced by another session', async () => {
+    const {page, context, response, args} = createHandlerMocks();
+    const traceOwner = {};
+    assert.ok(tryClaimPerformanceTrace(page.pptrPage, traceOwner));
+
+    try {
+      await navigate(args).handler(
+        {params: {url: 'https://other-session.example/'}, page},
+        response,
+        context,
+      );
+
+      sinon.assert.notCalled(page.pptrPage.goto);
+      sinon.assert.calledOnceWithExactly(
+        response.appendResponseLine,
+        PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+      );
+    } finally {
+      releasePerformanceTrace(page.pptrPage, traceOwner);
+    }
+  });
+
+  it('waits for in-flight slim navigation before starting a trace', async () => {
+    const {page, context, response, args} = createHandlerMocks();
+    const navigationPage = createMockMcpPage({pptrPage: page.pptrPage});
+    const navigationStarted = Promise.withResolvers<void>();
+    const finishNavigation = Promise.withResolvers<void>();
+    page.pptrPage.goto.callsFake(async () => {
+      navigationStarted.resolve();
+      await finishNavigation.promise;
+      return null;
+    });
+
+    let navigationPromise: Promise<void> | undefined;
+    let tracePromise: Promise<void> | undefined;
+    try {
+      navigationPromise = navigate(args).handler(
+        {params: {url: 'https://navigation.example/'}, page: navigationPage},
+        response,
+        context,
+      );
+      await navigationStarted.promise;
+
+      tracePromise = startTrace(args).handler(
+        {params: {reload: false, autoStop: false}, page},
+        response,
+        context,
+      );
+      await Promise.resolve();
+      sinon.assert.notCalled(page.pptrPage.tracing.start);
+
+      finishNavigation.resolve();
+      await navigationPromise;
+      await tracePromise;
+      sinon.assert.calledOnce(page.pptrPage.tracing.start);
+    } finally {
+      finishNavigation.resolve();
+      await navigationPromise;
+      await tracePromise;
+      releasePerformanceTrace(page.pptrPage, page);
+      page.setIsRunningPerformanceTrace(false);
+    }
   });
 
   it('throws when URL does not parse with new URL', async () => {

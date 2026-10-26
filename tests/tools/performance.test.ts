@@ -15,13 +15,29 @@ import {
   startTrace,
   stopTrace,
 } from '../../src/tools/performance.js';
+import {navigatePage} from '../../src/tools/pages.js';
 import {
   parseRawTraceBuffer,
   type TraceResult,
   traceResultIsSuccess,
 } from '../../src/processors/PerformanceTrace.js';
 import {DevTools} from '../../src/third_party/index.js';
-import {createHandlerMocks, createMockMcpPage} from '../mocks.js';
+import {
+  finishPageClose,
+  PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE,
+  PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+  tryBeginPageClose,
+  tryClaimPerformanceTrace,
+  releasePerformanceTrace,
+  withPerformanceTraceGlobalLock,
+  withPerformanceTracePageLock,
+} from '../../src/utils/PerformanceTraceRegistry.js';
+import {
+  createHandlerMocks,
+  createMockMcpContext,
+  createMockMcpPage,
+  createMockMcpResponse,
+} from '../mocks.js';
 import {loadTraceAsBuffer} from '../trace-processing/fixtures/load.js';
 import {withMcpContext} from '../utils.js';
 
@@ -41,6 +57,475 @@ describe('performance', () => {
   });
 
   describe('performance_start_trace', () => {
+    it('fails fast when the global trace lock is busy without holding the page lock', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+
+      let releaseGlobalLock!: () => void;
+      let enterGlobalLock!: () => void;
+      const globalLockEntered = new Promise<void>(resolve => {
+        enterGlobalLock = resolve;
+      });
+      const globalLockGate = new Promise<void>(resolve => {
+        releaseGlobalLock = resolve;
+      });
+      const lockPromise = withPerformanceTraceGlobalLock(async () => {
+        enterGlobalLock();
+        await globalLockGate;
+      });
+      let tracePromise: Promise<void> | undefined;
+      let navigationPromise: Promise<void> | undefined;
+      let navigationStarted = false;
+      try {
+        await globalLockEntered;
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: false, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await tracePromise;
+
+        page.pptrPage.goto.callsFake(async () => {
+          navigationStarted = true;
+          return null;
+        });
+        navigationPromise = navigatePage(args).handler(
+          {params: {url: 'https://example.com'}, page},
+          response,
+          context,
+        );
+        await navigationPromise;
+
+        assert.strictEqual(navigationStarted, true);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE,
+        );
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+      } finally {
+        releaseGlobalLock();
+        await Promise.all([
+          lockPromise.catch(() => undefined),
+          tracePromise?.catch(() => undefined),
+          navigationPromise?.catch(() => undefined),
+        ]);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('does not deadlock when a page script awaits a service-worker evaluation', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+
+      let enterPageScript!: () => void;
+      const pageScriptEntered = new Promise<void>(resolve => {
+        enterPageScript = resolve;
+      });
+      const workerEvaluationFinished = Promise.withResolvers<void>();
+      const pageScriptPromise = withPerformanceTracePageLock(
+        page.pptrPage,
+        async () => {
+          enterPageScript();
+          await workerEvaluationFinished.promise;
+        },
+      );
+      let workerPromise: Promise<void> | undefined;
+      let tracePromise: Promise<void> | undefined;
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await pageScriptEntered;
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: false, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await new Promise<void>(resolve => setImmediate(resolve));
+
+        workerPromise = withPerformanceTraceGlobalLock(async () => {});
+        void workerPromise.then(() => workerEvaluationFinished.resolve());
+        const completed = await Promise.race([
+          Promise.all([workerPromise, pageScriptPromise, tracePromise]).then(
+            () => true,
+          ),
+          new Promise<boolean>(resolve => {
+            timeoutHandle = setTimeout(() => resolve(false), 1_000);
+          }),
+        ]);
+
+        assert.strictEqual(completed, true);
+        sinon.assert.calledOnce(page.pptrPage.tracing.start);
+      } finally {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+        workerEvaluationFinished.resolve();
+        await Promise.all([
+          workerPromise?.catch(() => undefined),
+          pageScriptPromise.catch(() => undefined),
+          tracePromise?.catch(() => undefined),
+        ]);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('does not start a trace after performance tools are disabled while queued', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+
+      let releasePageLock!: () => void;
+      let enterPageLock!: () => void;
+      const pageLockEntered = new Promise<void>(resolve => {
+        enterPageLock = resolve;
+      });
+      const pageLockGate = new Promise<void>(resolve => {
+        releasePageLock = resolve;
+      });
+      const lockPromise = withPerformanceTracePageLock(
+        page.pptrPage,
+        async () => {
+          enterPageLock();
+          await pageLockGate;
+        },
+      );
+      let tracePromise: Promise<void> | undefined;
+      try {
+        await pageLockEntered;
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: false, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await new Promise<void>(resolve => setImmediate(resolve));
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+
+        context.isPerformanceTraceEnabled.returns(false);
+        releasePageLock();
+        await Promise.all([lockPromise, tracePromise]);
+
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          'Error: performance tools are disabled.',
+        );
+      } finally {
+        releasePageLock();
+        await Promise.all([
+          lockPromise.catch(() => undefined),
+          tracePromise?.catch(() => undefined),
+        ]);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('does not start a trace after its page is disposed while queued', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+
+      let releasePageLock!: () => void;
+      let enterPageLock!: () => void;
+      const pageLockEntered = new Promise<void>(resolve => {
+        enterPageLock = resolve;
+      });
+      const pageLockGate = new Promise<void>(resolve => {
+        releasePageLock = resolve;
+      });
+      const lockPromise = withPerformanceTracePageLock(
+        page.pptrPage,
+        async () => {
+          enterPageLock();
+          await pageLockGate;
+        },
+      );
+      let tracePromise: Promise<void> | undefined;
+      try {
+        await pageLockEntered;
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: false, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await new Promise<void>(resolve => setImmediate(resolve));
+        page.isClosed.returns(true);
+
+        releasePageLock();
+        await Promise.all([lockPromise, tracePromise]);
+
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+        );
+      } finally {
+        releasePageLock();
+        await Promise.all([
+          lockPromise.catch(() => undefined),
+          tracePromise?.catch(() => undefined),
+        ]);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('cancels setup when the page is disposed during the initial navigation', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+      page.pptrPage.url.returns('https://trace.example/');
+
+      let releaseNavigation!: () => void;
+      let enterNavigation!: () => void;
+      const navigationEntered = new Promise<void>(resolve => {
+        enterNavigation = resolve;
+      });
+      const navigationGate = new Promise<void>(resolve => {
+        releaseNavigation = resolve;
+      });
+      page.pptrPage.goto.callsFake(async url => {
+        if (url === 'about:blank') {
+          enterNavigation();
+          await navigationGate;
+        }
+        return null;
+      });
+
+      let tracePromise: Promise<void> | undefined;
+      try {
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: true, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await navigationEntered;
+        page.isClosed.returns(true);
+        releaseNavigation();
+        await tracePromise;
+
+        sinon.assert.calledOnceWithExactly(page.pptrPage.goto, 'about:blank', {
+          waitUntil: 'load',
+        });
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+        );
+        sinon.assert.calledWith(page.setIsRunningPerformanceTrace, false);
+      } finally {
+        releaseNavigation();
+        await tracePromise?.catch(() => undefined);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('stops trace setup if disposed while tracing starts', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+      page.pptrPage.url.returns('https://trace.example/');
+
+      let releaseTraceStart!: () => void;
+      let enterTraceStart!: () => void;
+      const traceStartEntered = new Promise<void>(resolve => {
+        enterTraceStart = resolve;
+      });
+      const traceStartGate = new Promise<void>(resolve => {
+        releaseTraceStart = resolve;
+      });
+      page.pptrPage.tracing.start.callsFake(async () => {
+        enterTraceStart();
+        await traceStartGate;
+      });
+
+      let tracePromise: Promise<void> | undefined;
+      try {
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: true, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await traceStartEntered;
+        page.isClosed.returns(true);
+        releaseTraceStart();
+        await tracePromise;
+
+        sinon.assert.calledOnceWithExactly(page.pptrPage.goto, 'about:blank', {
+          waitUntil: 'load',
+        });
+        sinon.assert.calledOnce(page.pptrPage.tracing.stop);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+        );
+        sinon.assert.calledWith(page.setIsRunningPerformanceTrace, false);
+      } finally {
+        releaseTraceStart();
+        await tracePromise?.catch(() => undefined);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('stops trace setup if performance tools are disabled while tracing starts', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+      page.pptrPage.url.returns('https://trace.example/');
+
+      let releaseTraceStart!: () => void;
+      let enterTraceStart!: () => void;
+      const traceStartEntered = new Promise<void>(resolve => {
+        enterTraceStart = resolve;
+      });
+      const traceStartGate = new Promise<void>(resolve => {
+        releaseTraceStart = resolve;
+      });
+      page.pptrPage.tracing.start.callsFake(async () => {
+        enterTraceStart();
+        await traceStartGate;
+      });
+
+      let tracePromise: Promise<void> | undefined;
+      try {
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: true, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await traceStartEntered;
+        context.isPerformanceTraceEnabled.returns(false);
+        releaseTraceStart();
+        await tracePromise;
+
+        sinon.assert.calledOnceWithExactly(page.pptrPage.goto, 'about:blank', {
+          waitUntil: 'load',
+        });
+        sinon.assert.calledOnce(page.pptrPage.tracing.stop);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          'Error: performance tools are disabled.',
+        );
+        sinon.assert.calledWith(page.setIsRunningPerformanceTrace, false);
+      } finally {
+        releaseTraceStart();
+        await tracePromise?.catch(() => undefined);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('restores the original URL when disabled during the initial navigation', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.isPerformanceTraceEnabled.returns(true);
+      page.pptrPage.url.returns('https://trace.example/');
+
+      let releaseNavigation!: () => void;
+      let enterNavigation!: () => void;
+      const navigationEntered = new Promise<void>(resolve => {
+        enterNavigation = resolve;
+      });
+      const navigationGate = new Promise<void>(resolve => {
+        releaseNavigation = resolve;
+      });
+      page.pptrPage.goto.callsFake(async url => {
+        if (String(url) === 'about:blank') {
+          page.pptrPage.url.returns('about:blank');
+          enterNavigation();
+          await navigationGate;
+        } else {
+          page.pptrPage.url.returns(String(url));
+        }
+        return null;
+      });
+
+      let tracePromise: Promise<void> | undefined;
+      try {
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: true, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await navigationEntered;
+        context.isPerformanceTraceEnabled.returns(false);
+        releaseNavigation();
+        await tracePromise;
+
+        sinon.assert.calledTwice(page.pptrPage.goto);
+        sinon.assert.calledWith(page.pptrPage.goto, 'about:blank', {
+          waitUntil: 'load',
+        });
+        sinon.assert.calledWith(page.pptrPage.goto, 'https://trace.example/', {
+          waitUntil: ['load'],
+        });
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          'Error: performance tools are disabled.',
+        );
+      } finally {
+        releaseNavigation();
+        await tracePromise?.catch(() => undefined);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
+    it('does not start a trace after a page close is reserved', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      const closeOwner = {};
+      assert.ok(tryBeginPageClose(page.pptrPage, closeOwner));
+
+      try {
+        await startTrace(args).handler(
+          {
+            params: {reload: false, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+
+        sinon.assert.calledOnceWithExactly(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+        );
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+      } finally {
+        finishPageClose(page.pptrPage);
+      }
+    });
+
     it('starts a trace recording and reloads the page by default', async () => {
       const {page, context, response, args} = createHandlerMocks();
       context.isRunningPerformanceTrace.returns(false);
@@ -83,6 +568,128 @@ describe('performance', () => {
         response.appendResponseLine,
         sinon.match(/The performance trace is being recorded/),
       );
+    });
+
+    it('does not navigate or stop a trace owned by another context', async () => {
+      const {
+        page: firstPage,
+        context: firstContext,
+        response: firstResponse,
+        args,
+      } = createHandlerMocks();
+      const secondPage = createMockMcpPage({pptrPage: firstPage.pptrPage});
+      const secondContext = createMockMcpContext({selectedPage: secondPage});
+      const secondResponse = createMockMcpResponse();
+      firstContext.isRunningPerformanceTrace.returns(false);
+      secondContext.isRunningPerformanceTrace.returns(false);
+
+      let firstTraceRunning = false;
+      firstPage.isRunningPerformanceTrace.callsFake(() => firstTraceRunning);
+      firstPage.setIsRunningPerformanceTrace.callsFake(isRunning => {
+        firstTraceRunning = isRunning;
+      });
+      let secondTraceRunning = false;
+      secondPage.isRunningPerformanceTrace.callsFake(() => secondTraceRunning);
+      secondPage.setIsRunningPerformanceTrace.callsFake(isRunning => {
+        secondTraceRunning = isRunning;
+      });
+
+      const traceData = loadTraceAsBuffer('basic-trace.json.gz');
+      firstPage.pptrPage.tracing.start.onFirstCall().resolves();
+      firstPage.pptrPage.tracing.start
+        .onSecondCall()
+        .rejects(new Error('Trace already running'));
+      firstPage.pptrPage.tracing.stop.resolves(traceData);
+
+      try {
+        await startTrace(args).handler(
+          {params: {reload: true, autoStop: false}, page: firstPage},
+          firstResponse,
+          firstContext,
+        );
+
+        await startTrace(args).handler(
+          {params: {reload: true, autoStop: false}, page: secondPage},
+          secondResponse,
+          secondContext,
+        );
+
+        sinon.assert.calledOnce(firstPage.pptrPage.tracing.start);
+        sinon.assert.calledTwice(firstPage.pptrPage.goto);
+        sinon.assert.notCalled(firstPage.pptrPage.tracing.stop);
+        sinon.assert.notCalled(secondPage.setIsRunningPerformanceTrace);
+        sinon.assert.calledOnceWithExactly(
+          secondResponse.appendResponseLine,
+          'Error: a performance trace is already running. Use performance_stop_trace to stop it. Only one trace can be running at any given time.',
+        );
+      } finally {
+        if (firstTraceRunning) {
+          await stopTrace(args).handler(
+            {params: {}, page: firstPage},
+            firstResponse,
+            firstContext,
+          );
+        }
+      }
+    });
+
+    it('allows another session to start after the shared page trace stops', async () => {
+      const {
+        page: firstPage,
+        context: firstContext,
+        response: firstResponse,
+        args,
+      } = createHandlerMocks();
+      const secondPage = createMockMcpPage({pptrPage: firstPage.pptrPage});
+      const secondContext = createMockMcpContext({selectedPage: secondPage});
+      const secondResponse = createMockMcpResponse();
+      firstContext.isRunningPerformanceTrace.returns(false);
+      secondContext.isRunningPerformanceTrace.returns(false);
+
+      let firstTraceRunning = false;
+      firstPage.isRunningPerformanceTrace.callsFake(() => firstTraceRunning);
+      firstPage.setIsRunningPerformanceTrace.callsFake(isRunning => {
+        firstTraceRunning = isRunning;
+      });
+      let secondTraceRunning = false;
+      secondPage.isRunningPerformanceTrace.callsFake(() => secondTraceRunning);
+      secondPage.setIsRunningPerformanceTrace.callsFake(isRunning => {
+        secondTraceRunning = isRunning;
+      });
+
+      firstPage.pptrPage.tracing.stop.resolves(
+        loadTraceAsBuffer('basic-trace.json.gz'),
+      );
+
+      try {
+        await startTrace(args).handler(
+          {params: {reload: false, autoStop: false}, page: firstPage},
+          firstResponse,
+          firstContext,
+        );
+        await stopTrace(args).handler(
+          {params: {}, page: firstPage},
+          firstResponse,
+          firstContext,
+        );
+
+        await startTrace(args).handler(
+          {params: {reload: false, autoStop: false}, page: secondPage},
+          secondResponse,
+          secondContext,
+        );
+
+        sinon.assert.calledTwice(firstPage.pptrPage.tracing.start);
+        assert.strictEqual(secondTraceRunning, true);
+      } finally {
+        if (secondTraceRunning) {
+          await stopTrace(args).handler(
+            {params: {}, page: secondPage},
+            secondResponse,
+            secondContext,
+          );
+        }
+      }
     });
 
     it('does not reload when reload is false', async () => {
@@ -147,6 +754,7 @@ describe('performance', () => {
       );
 
       sinon.assert.calledTwice(page.pptrPage.setCacheEnabled);
+      sinon.assert.calledOnce(page.pptrPage.tracing.stop);
       sinon.assert.calledWithExactly(
         page.pptrPage.setCacheEnabled.secondCall,
         true,
@@ -238,7 +846,7 @@ describe('performance', () => {
       sinon.assert.notCalled(page.pptrPage.goto);
     });
 
-    it('resets the running flag if a setup step throws', async () => {
+    it('resets the running flag without stopping an unstarted trace', async () => {
       const {page, context, response, args} = createHandlerMocks();
       context.isRunningPerformanceTrace.returns(false);
       page.isRunningPerformanceTrace.returns(true);
@@ -258,7 +866,7 @@ describe('performance', () => {
       );
 
       sinon.assert.notCalled(page.pptrPage.tracing.start);
-      sinon.assert.calledOnce(page.pptrPage.tracing.stop);
+      sinon.assert.notCalled(page.pptrPage.tracing.stop);
       sinon.assert.calledTwice(page.setIsRunningPerformanceTrace);
       sinon.assert.calledWithExactly(
         page.setIsRunningPerformanceTrace.firstCall,
@@ -420,7 +1028,14 @@ describe('performance', () => {
     it('will stop the trace and return trace info when a trace is running', async () => {
       const rawData = loadTraceAsBuffer('basic-trace.json.gz');
       await withMcpContext(async (response, context, args) => {
-        context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+        const selectedMcpPageForTrace = context.getSelectedMcpPage();
+        assert.ok(
+          tryClaimPerformanceTrace(
+            selectedMcpPageForTrace.pptrPage,
+            selectedMcpPageForTrace,
+          ),
+        );
+        selectedMcpPageForTrace.setIsRunningPerformanceTrace(true);
         const selectedPage = context.getSelectedMcpPage().pptrPage;
         const stopTracingStub = sinon
           .stub(selectedPage.tracing, 'stop')
@@ -444,7 +1059,14 @@ describe('performance', () => {
 
     it('throws an error if parsing the trace buffer fails', async () => {
       await withMcpContext(async (response, context, args) => {
-        context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+        const selectedMcpPageForTrace = context.getSelectedMcpPage();
+        assert.ok(
+          tryClaimPerformanceTrace(
+            selectedMcpPageForTrace.pptrPage,
+            selectedMcpPageForTrace,
+          ),
+        );
+        selectedMcpPageForTrace.setIsRunningPerformanceTrace(true);
         const selectedPage = context.getSelectedMcpPage().pptrPage;
         sinon
           .stub(selectedPage.tracing, 'stop')
@@ -465,7 +1087,14 @@ describe('performance', () => {
       const rawData = loadTraceAsBuffer('basic-trace.json.gz');
       await withMcpContext(async (response, context, args) => {
         const filePath = 'test-trace.json';
-        context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+        const selectedMcpPageForTrace = context.getSelectedMcpPage();
+        assert.ok(
+          tryClaimPerformanceTrace(
+            selectedMcpPageForTrace.pptrPage,
+            selectedMcpPageForTrace,
+          ),
+        );
+        selectedMcpPageForTrace.setIsRunningPerformanceTrace(true);
         const selectedPage = context.getSelectedMcpPage().pptrPage;
         const stopTracingStub = sinon
           .stub(selectedPage.tracing, 'stop')
@@ -495,7 +1124,14 @@ describe('performance', () => {
       const rawData = loadTraceAsBuffer('basic-trace.json.gz');
       await withMcpContext(
         async (response, context, args) => {
-          context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+          const selectedMcpPageForTrace = context.getSelectedMcpPage();
+          assert.ok(
+            tryClaimPerformanceTrace(
+              selectedMcpPageForTrace.pptrPage,
+              selectedMcpPageForTrace,
+            ),
+          );
+          selectedMcpPageForTrace.setIsRunningPerformanceTrace(true);
           const selectedPage = context.getSelectedMcpPage().pptrPage;
           sinon.stub(selectedPage.tracing, 'stop').resolves(rawData);
 
@@ -523,7 +1159,14 @@ describe('performance', () => {
     it('fetches CrUX data for desktop and includes it in the summary', async () => {
       const rawData = loadTraceAsBuffer('web-dev-with-commit.json.gz');
       await withMcpContext(async (response, context, args) => {
-        context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+        const selectedMcpPageForTrace = context.getSelectedMcpPage();
+        assert.ok(
+          tryClaimPerformanceTrace(
+            selectedMcpPageForTrace.pptrPage,
+            selectedMcpPageForTrace,
+          ),
+        );
+        selectedMcpPageForTrace.setIsRunningPerformanceTrace(true);
         const selectedPage = context.getSelectedMcpPage().pptrPage;
         sinon.stub(selectedPage.tracing, 'stop').resolves(rawData);
 
@@ -576,7 +1219,14 @@ describe('performance', () => {
       const modifiedData = new TextEncoder().encode(modifiedJsonString);
 
       await withMcpContext(async (response, context, args) => {
-        context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+        const selectedMcpPageForTrace = context.getSelectedMcpPage();
+        assert.ok(
+          tryClaimPerformanceTrace(
+            selectedMcpPageForTrace.pptrPage,
+            selectedMcpPageForTrace,
+          ),
+        );
+        selectedMcpPageForTrace.setIsRunningPerformanceTrace(true);
         const selectedPage = context.getSelectedMcpPage().pptrPage;
         sinon.stub(selectedPage.tracing, 'stop').resolves(modifiedData);
 

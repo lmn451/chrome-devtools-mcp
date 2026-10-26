@@ -35,6 +35,11 @@ import {
   traceResultIsSuccess,
 } from '../src/processors/PerformanceTrace.js';
 import {resolveCanonicalPath} from '../src/utils/files.js';
+import {
+  releasePerformanceTrace,
+  tryClaimPerformanceTrace,
+  withPerformanceTracePageLock,
+} from '../src/utils/PerformanceTraceRegistry.js';
 import {stableIdSymbol} from '../src/utils/id.js';
 
 import type {ServerConfig} from '../src/config/ServerConfig.js';
@@ -328,6 +333,42 @@ describe('McpContext', () => {
         assert.throws(() => context.getPageById(pageId), /No page found/);
       } finally {
         urlStub.restore();
+      }
+    });
+  });
+
+  it('stops and releases a trace when its page is pruned', async () => {
+    await withMcpContext(async (_response, context) => {
+      const page = await context.newPage();
+      const pptrPage = page.pptrPage;
+      const traceStop = Promise.withResolvers<Uint8Array>();
+      const stopStub = sinon
+        .stub(pptrPage.tracing, 'stop')
+        .returns(traceStop.promise);
+      const urlStub = sinon.stub(pptrPage, 'url').returns('chrome://settings');
+      const nextOwner = {};
+      assert.ok(tryClaimPerformanceTrace(pptrPage, page));
+      page.setIsRunningPerformanceTrace(true);
+
+      try {
+        await context.createPagesSnapshot();
+        assert.ok(!context.getPages().includes(page));
+        assert.strictEqual(
+          tryClaimPerformanceTrace(pptrPage, nextOwner),
+          false,
+        );
+
+        traceStop.resolve(new Uint8Array());
+        await context.dispose();
+
+        assert.ok(tryClaimPerformanceTrace(pptrPage, nextOwner));
+      } finally {
+        traceStop.resolve(new Uint8Array());
+        await context.dispose();
+        releasePerformanceTrace(pptrPage, page);
+        releasePerformanceTrace(pptrPage, nextOwner);
+        urlStub.restore();
+        stopStub.restore();
       }
     });
   });
@@ -873,6 +914,48 @@ describe('McpContext', () => {
     });
   });
 
+  it('does not close a page disposed while closePage waits on its operation lock', async () => {
+    await withMcpContext(async (_response, context) => {
+      const page = await context.newPage();
+      const pptrPage = page.pptrPage;
+
+      let releasePageLock!: () => void;
+      let enterPageLock!: () => void;
+      const pageLockEntered = new Promise<void>(resolve => {
+        enterPageLock = resolve;
+      });
+      const pageLockGate = new Promise<void>(resolve => {
+        releasePageLock = resolve;
+      });
+      const pageLockPromise = withPerformanceTracePageLock(
+        pptrPage,
+        async () => {
+          enterPageLock();
+          await pageLockGate;
+        },
+      );
+      let closePromise: Promise<void> | undefined;
+      let disposePromise: Promise<void> | undefined;
+      try {
+        await pageLockEntered;
+        closePromise = context.closePage(page.id);
+        await new Promise<void>(resolve => setImmediate(resolve));
+        disposePromise = page.disposeAsync();
+        releasePageLock();
+        await pageLockPromise;
+
+        await assert.rejects(closePromise, /closing/i);
+        await disposePromise;
+        assert.strictEqual(pptrPage.isClosed(), false);
+      } finally {
+        releasePageLock();
+        await pageLockPromise.catch(() => undefined);
+        await closePromise?.catch(() => undefined);
+        await disposePromise?.catch(() => undefined);
+      }
+    });
+  });
+
   it('reports an unknown page id before the last-page guard on close', async () => {
     await withMcpContext(async (_response, context) => {
       const page = context.getSelectedMcpPage();
@@ -1007,7 +1090,8 @@ describe('McpContext', () => {
 
     it('resets the browser state and reports a reconnect notice once when the browser changes', async () => {
       const firstBrowser = createBrowser();
-      firstBrowser.targets.returns([createMockPuppeteerTarget()]);
+      const {page: pptrPage, target: firstTarget} = createPageTarget();
+      firstBrowser.targets.returns([firstTarget]);
       const secondBrowser = createBrowser();
       const getBrowser = sinon.stub<[], Promise<Browser>>();
       getBrowser.onFirstCall().resolves(firstBrowser);
@@ -1016,12 +1100,19 @@ describe('McpContext', () => {
 
       await context.ensureBrowser();
       assert.ok(!context.consumeReconnectNotice());
-      context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+      const activePage = context.getSelectedMcpPage();
+      assert.strictEqual(activePage.pptrPage, pptrPage);
+      assert.ok(tryClaimPerformanceTrace(pptrPage, activePage));
+      activePage.setIsRunningPerformanceTrace(true);
 
       await context.ensureBrowser();
 
       assert.strictEqual(context.browser, secondBrowser);
       assert.ok(!context.isRunningPerformanceTrace());
+      sinon.assert.calledOnceWithExactly(pptrPage.tracing.stop);
+      const nextOwner = {};
+      assert.ok(tryClaimPerformanceTrace(pptrPage, nextOwner));
+      releasePerformanceTrace(pptrPage, nextOwner);
       sinon.assert.calledWith(
         firstBrowser.off,
         'targetcreated',
@@ -2151,21 +2242,62 @@ describe('McpContext', () => {
       sinon.assert.notCalled(disposeSpy);
     });
 
+    it('reports whether performance tools are enabled by current config', async () => {
+      const enabledContext = await createMockContext({
+        config: createMockServerConfig({categoryPerformance: true}),
+      });
+      const disabledContext = await createMockContext({
+        config: createMockServerConfig({categoryPerformance: false}),
+      });
+
+      try {
+        assert.strictEqual(enabledContext.isPerformanceTraceEnabled(), true);
+        assert.strictEqual(disabledContext.isPerformanceTraceEnabled(), false);
+      } finally {
+        await enabledContext.dispose();
+        await disabledContext.dispose();
+      }
+    });
+
+    it('skips uninitialized pages when releasing performance traces', async () => {
+      const initializedPage = createPageTarget();
+      const uninitializedTarget = createMockPuppeteerTarget();
+      const context = await createMockContext({
+        targets: [initializedPage.target, uninitializedTarget],
+      });
+
+      try {
+        await assert.doesNotReject(context.releasePerformanceTrace());
+      } finally {
+        await context.dispose();
+      }
+    });
+
     it('stops the running performance trace and clears recorded traces', async () => {
       const {page: pptrPage, target} = createPageTarget();
       const context = await createMockContext({targets: [target]});
-      context.getSelectedMcpPage().setIsRunningPerformanceTrace(true);
+      const mcpPage = context.getSelectedMcpPage();
+      assert.ok(tryClaimPerformanceTrace(pptrPage, mcpPage));
+      mcpPage.setIsRunningPerformanceTrace(true);
       const traceResult = await parseRawTraceBuffer(
         loadTraceAsBuffer('basic-trace.json.gz'),
       );
       assert.ok(traceResultIsSuccess(traceResult));
       context.storeTraceRecording(traceResult);
 
-      await context.releasePerformanceTrace();
+      const stopPromise = Promise.withResolvers<Uint8Array>();
+      pptrPage.tracing.stop.returns(stopPromise.promise);
+      const releasingTrace = context.releasePerformanceTrace();
+      const nextOwner = {};
+      assert.strictEqual(tryClaimPerformanceTrace(pptrPage, nextOwner), false);
+      stopPromise.resolve(new Uint8Array());
+      await releasingTrace;
 
       sinon.assert.calledOnceWithExactly(pptrPage.tracing.stop);
       assert.strictEqual(context.isRunningPerformanceTrace(), false);
       assert.deepStrictEqual(context.recordedTraces(), []);
+      assert.ok(tryClaimPerformanceTrace(pptrPage, nextOwner));
+      releasePerformanceTrace(pptrPage, nextOwner);
     });
 
     it('disposes comment bridges once per page when devtoolsComments is released', async () => {

@@ -16,9 +16,21 @@ import sinon from 'sinon';
 import {TextSnapshot} from '../../src/TextSnapshot.js';
 import {zod} from '../../src/third_party/index.js';
 import {installExtension} from '../../src/tools/extensions.js';
+import {startTrace} from '../../src/tools/performance.js';
 import {evaluateScript} from '../../src/tools/script.js';
+import {
+  PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE,
+  PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+  releasePerformanceTrace,
+  tryClaimPerformanceTrace,
+} from '../../src/utils/PerformanceTraceRegistry.js';
 import {WaitForHelper} from '../../src/utils/WaitForHelper.js';
-import {createHandlerMocks, createMockParsedArguments} from '../mocks.js';
+import {
+  createHandlerMocks,
+  createMockMcpWorker,
+  createMockParsedArguments,
+  createMockWebWorker,
+} from '../mocks.js';
 import {serverHooks} from '../server.js';
 import {
   assertNoServiceWorkerReported,
@@ -49,6 +61,28 @@ describe('script', () => {
         const lineEvaluation = response.responseLines.at(2)!;
         assert.strictEqual(JSON.parse(lineEvaluation), 10);
       });
+    });
+    it('does not evaluate a page traced by another session', async () => {
+      const {page, response, context, args} = createHandlerMocks();
+      const traceOwner = {};
+      assert.ok(tryClaimPerformanceTrace(page.pptrPage, traceOwner));
+      page.waitForEventsAfterAction.resolves({} as never);
+
+      try {
+        await evaluateScript(args).handler(
+          {params: {function: '() => window.location.href'}},
+          response,
+          context,
+        );
+
+        sinon.assert.notCalled(page.waitForEventsAfterAction);
+        sinon.assert.calledOnceWithExactly(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+        );
+      } finally {
+        releasePerformanceTrace(page.pptrPage, traceOwner);
+      }
     });
     it('evaluates an inline classic script', async () => {
       await withMcpContext(async (response, context, args) => {
@@ -567,6 +601,103 @@ describe('script', () => {
       const content = await readFile(filePath, 'utf-8');
       assert.deepStrictEqual(JSON.parse(content), {hello: 'world'});
     });
+    it('does not evaluate a service worker while a performance trace is active', async () => {
+      const {page, response, context} = createHandlerMocks();
+      const traceOwner = {};
+      assert.ok(tryClaimPerformanceTrace(page.pptrPage, traceOwner));
+      const webWorker = createMockWebWorker();
+      const serviceWorker = createMockMcpWorker({worker: webWorker});
+      context.getWorkerById.returns(serviceWorker);
+      page.waitForEventsAfterAction.resolves({} as never);
+
+      try {
+        await evaluateScript(
+          createMockParsedArguments({categoryExtensions: true}),
+        ).handler(
+          {
+            params: {
+              function: '() => clients.matchAll()',
+              serviceWorkerId: 'sw-1',
+            },
+          },
+          response,
+          context,
+        );
+
+        sinon.assert.notCalled(page.waitForEventsAfterAction);
+        sinon.assert.calledOnceWithExactly(
+          response.appendResponseLine,
+          'Error: service-worker evaluation is blocked while a performance trace is active because it may navigate a traced tab.',
+        );
+      } finally {
+        releasePerformanceTrace(page.pptrPage, traceOwner);
+      }
+    });
+
+    it('fails fast when a service-worker evaluation is in progress', async () => {
+      const {page, response, context, args} = createHandlerMocks();
+      context.isRunningPerformanceTrace.returns(false);
+      context.getWorkerById.returns(
+        createMockMcpWorker({worker: createMockWebWorker()}),
+      );
+      let releaseEvaluation!: () => void;
+      let enterEvaluation!: () => void;
+      const evaluationEntered = new Promise<void>(resolve => {
+        enterEvaluation = resolve;
+      });
+      const evaluationGate = new Promise<void>(resolve => {
+        releaseEvaluation = resolve;
+      });
+      page.waitForEventsAfterAction.callsFake(async () => {
+        enterEvaluation();
+        await evaluationGate;
+        return {dialogHandled: false} as never;
+      });
+
+      const evaluatePromise = evaluateScript(
+        createMockParsedArguments({categoryExtensions: true}),
+      ).handler(
+        {
+          params: {
+            function: '() => clients.matchAll()',
+            serviceWorkerId: 'sw-1',
+          },
+        },
+        response,
+        context,
+      );
+      let tracePromise: Promise<void> | undefined;
+      try {
+        await evaluationEntered;
+        tracePromise = startTrace(args).handler(
+          {
+            params: {reload: false, autoStop: false},
+            page,
+          },
+          response,
+          context,
+        );
+        await tracePromise;
+
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+        sinon.assert.calledWith(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE,
+        );
+
+        releaseEvaluation();
+        await evaluatePromise;
+      } finally {
+        releaseEvaluation();
+        await Promise.all([
+          evaluatePromise.catch(() => undefined),
+          tracePromise?.catch(() => undefined),
+        ]);
+        page.setIsRunningPerformanceTrace(false);
+        releasePerformanceTrace(page.pptrPage, page);
+      }
+    });
+
     it('evaluates inside extension service worker', async () => {
       await withMcpContext(
         async (response, context, args) => {

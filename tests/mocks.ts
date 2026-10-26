@@ -560,6 +560,7 @@ export function createMockMcpContext(
   options: {selectedPage?: MockMcpPage; taskRunner?: TaskRunner} = {},
 ): MockMcpContext {
   const context = sinon.createStubInstance(McpContext);
+  context.isPerformanceTraceEnabled.returns(true);
   const page = options.selectedPage ?? createMockMcpPage();
   context.getSelectedMcpPage.returns(page satisfies McpPage);
   context.getTargetInfos.resolves(new Map());

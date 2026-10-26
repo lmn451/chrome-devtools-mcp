@@ -21,7 +21,13 @@ import {
   handleDialog,
   getTabId,
 } from '../../src/tools/pages.js';
+import {startTrace} from '../../src/tools/performance.js';
 import {zod} from '../../src/third_party/index.js';
+import {
+  PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+  releasePerformanceTrace,
+  tryClaimPerformanceTrace,
+} from '../../src/utils/PerformanceTraceRegistry.js';
 import {
   createHandlerMocks,
   createMockDialog,
@@ -799,6 +805,31 @@ describe('pages', () => {
         assert.ok(response.includePages);
       });
     });
+    it('does not close a page traced by another session', async () => {
+      await withMcpContext(async (response, context, args) => {
+        const page = await context.newPage();
+        const traceOwner = {};
+        assert.ok(tryClaimPerformanceTrace(page.pptrPage, traceOwner));
+
+        try {
+          await closePage(args).handler(
+            {params: {pageId: page.id}},
+            response,
+            context,
+          );
+
+          assert.ok(!page.pptrPage.isClosed());
+          assert.ok(
+            response.responseLines.includes(
+              'Error: this page is being traced by another MCP session. Stop that trace before closing it.',
+            ),
+          );
+        } finally {
+          releasePerformanceTrace(page.pptrPage, traceOwner);
+        }
+      });
+    });
+
     it('cannot close the last page', async () => {
       await withMcpContext(async (response, context, args) => {
         const page = context.getSelectedMcpPage().pptrPage;
@@ -1008,6 +1039,73 @@ describe('pages', () => {
         );
         assert.ok(response.includePages);
       });
+    });
+
+    it('does not navigate a shared page traced by another session', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      const traceOwner = {};
+      assert.ok(tryClaimPerformanceTrace(page.pptrPage, traceOwner));
+
+      try {
+        await navigatePage(args).handler(
+          {params: {url: 'https://other-session.example/'}, page},
+          response,
+          context,
+        );
+
+        sinon.assert.notCalled(page.pptrPage.goto);
+        sinon.assert.calledOnceWithExactly(
+          response.appendResponseLine,
+          PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+        );
+      } finally {
+        releasePerformanceTrace(page.pptrPage, traceOwner);
+      }
+    });
+
+    it('waits for in-flight navigation before starting a performance trace', async () => {
+      const {page, context, response, args} = createHandlerMocks();
+      const navigationPage = createMockMcpPage({pptrPage: page.pptrPage});
+      const navigationStarted = Promise.withResolvers<void>();
+      const finishNavigation = Promise.withResolvers<void>();
+      page.pptrPage.goto.callsFake(async () => {
+        navigationStarted.resolve();
+        await finishNavigation.promise;
+        return null;
+      });
+
+      let navigationPromise: Promise<void> | undefined;
+      let tracePromise: Promise<void> | undefined;
+      try {
+        navigationPromise = navigatePage(args).handler(
+          {
+            params: {type: 'url', url: 'https://navigation.example/'},
+            page: navigationPage,
+          },
+          response,
+          context,
+        );
+        await navigationStarted.promise;
+
+        tracePromise = startTrace(args).handler(
+          {params: {reload: false, autoStop: false}, page},
+          response,
+          context,
+        );
+        await Promise.resolve();
+        sinon.assert.notCalled(page.pptrPage.tracing.start);
+
+        finishNavigation.resolve();
+        await navigationPromise;
+        await tracePromise;
+        sinon.assert.calledOnce(page.pptrPage.tracing.start);
+      } finally {
+        finishNavigation.resolve();
+        await navigationPromise;
+        await tracePromise;
+        releasePerformanceTrace(page.pptrPage, page);
+        page.setIsRunningPerformanceTrace(false);
+      }
     });
 
     it('throws when navigating to a file URL and fileNavigations is false', async () => {

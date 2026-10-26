@@ -452,6 +452,23 @@ describe('McpPage', () => {
       assert.strictEqual(mcpPage.pptrPage, pptrPage);
     });
 
+    it('reports disposed pages as closed even while Puppeteer remains open', async () => {
+      const pptrPage = createMockPuppeteerPage();
+      pptrPage.isClosed.returns(false);
+      const target = createMockPuppeteerTarget({page: pptrPage});
+      const mcpPage = new McpPage(target, 1, {
+        config: createMockServerConfig(),
+        locatorClass: Locator,
+      });
+      await mcpPage.init();
+
+      mcpPage.dispose();
+
+      assert.strictEqual(pptrPage.isClosed(), false);
+      assert.strictEqual(mcpPage.isClosed(), true);
+      await mcpPage.disposeAsync();
+    });
+
     it('disposes safely before init() is called and rejects subsequent init()', async () => {
       const target = createMockPuppeteerTarget();
       const mcpPage = new McpPage(target, 1, {

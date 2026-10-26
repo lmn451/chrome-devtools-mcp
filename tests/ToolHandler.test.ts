@@ -15,7 +15,6 @@ import sinon from 'sinon';
 import {ConfigLocator} from '../src/config/ConfigLocator.js';
 import {ConfigParser} from '../src/config/ConfigParser.js';
 import type {McpContext} from '../src/McpContext.js';
-import {McpPage} from '../src/McpPage.js';
 import {McpResponse, type DataFormat} from '../src/McpResponse.js';
 import {ClearcutLogger} from '../src/telemetry/ClearcutLogger.js';
 import {
@@ -37,7 +36,18 @@ import {
 import {evaluateScript} from '../src/tools/script.js';
 import {createTools} from '../src/tools/tools.js';
 import {TaskRunner, type TaskQueue} from '../src/utils/TaskRunner.js';
-import {createMockMcpContext, createMockMcpPage} from './mocks.js';
+import {
+  PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+  PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
+  releasePerformanceTrace,
+  tryClaimPerformanceTrace,
+  withPerformanceTracePageLock,
+} from '../src/utils/PerformanceTraceRegistry.js';
+import {
+  createMockMcpContext,
+  createMockMcpPage,
+  createMockPuppeteerPage,
+} from './mocks.js';
 import {getMockBrowser, withMcpContext} from './utils.js';
 
 describe('ToolHandler', () => {
@@ -86,7 +96,7 @@ describe('ToolHandler', () => {
     const mockContext = createMockMcpContext();
     const mockProcess = sinon.createStubInstance(ChildProcess);
     mockContext.ensureBrowser.resolves(getMockBrowser({process: mockProcess}));
-    const mockPage = sinon.createStubInstance(McpPage);
+    const mockPage = createMockMcpPage();
     mockContext.getPageById.returns(mockPage);
 
     const toolHandler = new ToolHandler(
@@ -102,6 +112,125 @@ describe('ToolHandler', () => {
     sinon.assert.calledOnceWithExactly(mockContext.getPageById, 1);
     sinon.assert.calledOnceWithExactly(mockPage.init, {emulateFocus: true});
     assert.strictEqual(handlerCalled, true);
+  });
+
+  it('blocks shared-page mutations from another session during a trace', async () => {
+    const config = parseConfig();
+    let handlerCalled = false;
+    const tool = definePageTool(() => ({
+      name: 'click',
+      description: 'Click an element',
+      annotations: {
+        category: ToolCategory.INPUT,
+        readOnlyHint: false,
+      },
+      schema: {},
+      blockedByDialog: false,
+      concurrency: 'exclusive',
+      verifyFilesSchema: {},
+      handler: async () => {
+        handlerCalled = true;
+      },
+    }))(config.resolved);
+
+    const mockContext = createMockMcpContext();
+    const mockProcess = sinon.createStubInstance(ChildProcess);
+    mockContext.ensureBrowser.resolves(getMockBrowser({process: mockProcess}));
+    const isolatedRawPage = createMockPuppeteerPage();
+    const mockPage = createMockMcpPage({pptrPage: isolatedRawPage});
+    mockContext.getPageById.returns(mockPage);
+    const traceOwner = {};
+    assert.ok(tryClaimPerformanceTrace(mockPage.pptrPage, traceOwner));
+
+    const toolHandler = new ToolHandler(
+      tool,
+      config,
+      async () => mockContext,
+      sinon.spy(),
+    );
+
+    try {
+      const result = await toolHandler.handle({pageId: 1});
+      assert.ok(result.content[0].type === 'text');
+      assert.ok(
+        result.content[0].text.includes(
+          PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+        ),
+      );
+      assert.strictEqual(handlerCalled, false);
+    } finally {
+      releasePerformanceTrace(mockPage.pptrPage, traceOwner);
+    }
+  });
+
+  it('blocks queued page mutations after their McpPage is disposed', async () => {
+    const config = parseConfig();
+    let handlerCalled = false;
+    const tool = definePageTool(() => ({
+      name: 'click',
+      description: 'Click an element',
+      annotations: {
+        category: ToolCategory.INPUT,
+        readOnlyHint: false,
+      },
+      schema: {},
+      blockedByDialog: false,
+      concurrency: 'exclusive',
+      verifyFilesSchema: {},
+      handler: async () => {
+        handlerCalled = true;
+      },
+    }))(config.resolved);
+
+    const mockContext = createMockMcpContext();
+    const mockProcess = sinon.createStubInstance(ChildProcess);
+    mockContext.ensureBrowser.resolves(getMockBrowser({process: mockProcess}));
+    const mockPage = createMockMcpPage({pptrPage: createMockPuppeteerPage()});
+    mockPage.isClosed.returns(false);
+    mockContext.getPageById.returns(mockPage);
+
+    const toolHandler = new ToolHandler(
+      tool,
+      config,
+      async () => mockContext,
+      sinon.spy(),
+    );
+
+    let releasePageLock!: () => void;
+    let enterPageLock!: () => void;
+    const pageLockEntered = new Promise<void>(resolve => {
+      enterPageLock = resolve;
+    });
+    const pageLockGate = new Promise<void>(resolve => {
+      releasePageLock = resolve;
+    });
+    const pageLockPromise = withPerformanceTracePageLock(
+      mockPage.pptrPage,
+      async () => {
+        enterPageLock();
+        await pageLockGate;
+      },
+    );
+    let resultPromise: ReturnType<typeof toolHandler.handle> | undefined;
+    try {
+      await pageLockEntered;
+      resultPromise = toolHandler.handle({pageId: 1});
+      await new Promise<void>(resolve => setImmediate(resolve));
+      mockPage.isClosed.returns(true);
+      releasePageLock();
+      await pageLockPromise;
+
+      const result = await resultPromise;
+      assert.ok(result.content[0].type === 'text');
+      assert.ok(
+        result.content[0].text.includes(PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE),
+      );
+      assert.strictEqual(handlerCalled, false);
+    } finally {
+      releasePageLock();
+      await pageLockPromise.catch(() => undefined);
+      await resultPromise?.catch(() => undefined);
+    }
   });
 
   it('calls getSelectedMcpPage for page scoped tools when pageIdRouting is disabled', async () => {
@@ -126,7 +255,7 @@ describe('ToolHandler', () => {
     const mockContext = createMockMcpContext();
     const mockProcess = sinon.createStubInstance(ChildProcess);
     mockContext.ensureBrowser.resolves(getMockBrowser({process: mockProcess}));
-    const mockPage = sinon.createStubInstance(McpPage);
+    const mockPage = createMockMcpPage();
     mockContext.getSelectedMcpPage.returns(mockPage);
 
     const toolHandler = new ToolHandler(
@@ -1787,7 +1916,7 @@ describe('ToolHandler', () => {
     const mockProcess = sinon.createStubInstance(ChildProcess);
     mockContext.ensureBrowser.resolves(getMockBrowser({process: mockProcess}));
     mockContext.getDevToolsData.resolves({});
-    const mockPage = sinon.createStubInstance(McpPage);
+    const mockPage = createMockMcpPage();
     mockPage.getDialog.returns(undefined);
     sinon.stub(mockPage, 'networkConditions').get(() => undefined);
     sinon.stub(mockPage, 'geolocation').get(() => undefined);
