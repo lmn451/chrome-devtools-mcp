@@ -13,5 +13,13 @@
 
 - GitHub Actions run `40743449681` ran on `af371dbc0ef81c867754fdd22916b307e4f1178d`: the shared-browser HTTP multi-client test timed out after 120 seconds on Node 22/24; Node 26 passed. Presubmit `40743513820` and memory-leak run `40743519608` passed.
 - Reproduced locally with Node 22.23.3: the full suite at `--test-concurrency=2` hit the same timeout, while serial full suites passed on Node 22.23.3 and 24.21.0. The isolated HTTP multi-client test also passed on both runtimes.
-- Committed as `84a28a6` in `.github/workflows/run-tests.yml`: serialize tests on Windows and Node versions below 26, retaining parallel execution for Ubuntu/Node 26. `npm run check-format`, `git diff --check`, YAML parsing, and matrix-argument rendering passed. No Actions run exists for this local change yet.
-- No push or upstream merge was performed: live `origin/main` is `af371dbc0ef81c867754fdd22916b307e4f1178d`; live `upstream/main` is `bc0d93ee2df6f2410d9e9704903c3547acae7c9a` (47 commits ahead).
+- Committed as `84a28a6` in `.github/workflows/run-tests.yml`: serialize tests on Windows and Node versions below 26, retaining parallel execution for Ubuntu/Node 26. `npm run check-format`, `git diff --check`, YAML parsing, and matrix-argument rendering passed. No exact-SHA Actions run existed for this local change at that point.
+- At that point, no push or upstream merge had been performed: `origin/main` was `af371dbc0ef81c867754fdd22916b307e4f1178d`, `upstream/main` was `bc0d93ee2df6f2410d9e9704903c3547acae7c9a`; the fork was 47 commits ahead of upstream, while upstream was 4 commits ahead of the fork.
+
+## 2026-10-29 — upstream sync
+
+- Fresh fetch: `origin/main` `af371dbc0ef81c867754fdd22916b307e4f1178d`; `upstream/main` `3c609da38a39067f4a0b885ce81968eb958b76a`. The fork had 47 fork-only commits; upstream had 8 commits not yet in the fork.
+- Merged upstream `3c609da38a39067f4a0b885ce81968eb958b76a` as merge commit `c203188d40ab291c2a7aa53ce736d41bc995a709` with no merge conflicts. Retained the fork HTTP server, stdio proxy, shared-page performance-trace registry, HTTP tests, and manual workflow dispatches.
+- Carried the Node 22/24 serial-test adjustment forward as `9589caa`; the merge worktree also contains the fork's 47 commits.
+- Local verification passed: `npm ci`; build, CLI/docs/metrics generation, formatting and `git diff --check`; bundle (with non-fatal circular-dependency warnings); full suites on Node 22.23.3 and 24.21.0 (1,820 passed, 2 skipped, 0 failed each); notice tests (2 passed); memory profile with 1% threshold (exit 0).
+- At the time of this entry, the sync is prepared locally; push and exact-SHA GitHub Actions verification are still pending.
