@@ -67,11 +67,11 @@ jobs:
 
       - name: Run tests
         shell: bash
-        # Keep browser-heavy tests serial on Windows and Node < 26; the shared-browser HTTP integration test times out under file-level parallelism on those runtimes.
+        # Keep test files serial in CI: the shared-browser HTTP integration test times out under file-level parallelism, including on Node 26.
         # Retry tests if they fail in the merge queue.
         run: >
           npm run test:no-build --
-          ${{ (matrix.os == 'windows-latest' || matrix.node < 26) && '--test-concurrency=1' || '' }}
+          --test-concurrency=1
           ${{ github.event_name == 'merge_group' && '--retry' || '' }}
 
       - name: Run notices tests
