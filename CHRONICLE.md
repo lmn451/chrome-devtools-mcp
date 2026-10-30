@@ -23,3 +23,19 @@
 - Carried the Node 22/24 serial-test adjustment forward as `9589caa`; the merge worktree also contains the fork's 47 commits.
 - Local verification passed: `npm ci`; build, CLI/docs/metrics generation, formatting and `git diff --check`; bundle (with non-fatal circular-dependency warnings); full suites on Node 22.23.3 and 24.21.0 (1,820 passed, 2 skipped, 0 failed each); notice tests (2 passed); memory profile with 1% threshold (exit 0).
 - At the time of this entry, the sync is prepared locally; push and exact-SHA GitHub Actions verification are still pending.
+
+## 2026-10-30 — upstream sync
+
+- Merged upstream `8d009e854f8aa55b1ec31628e836d4d4731b8ec8` as
+  `86f0b0c2b64c8cf7743fa0c564a512b08a6707d1`, updating the DevTools frontend
+  pin from `1212f1bf37d47640deaef2911db0be022637c89d` to
+  `9447cb6aad3f414539ca9483b72ec7a24744c04a`.
+- Local checks passed: sync, build, CLI/docs/metrics generation,
+  format/check-format, diff check, bundle, notices, and the full serial test
+  suite; focused browser tests passed 34/34.
+- Exact-SHA Actions passed on `86f0b0c`: compile/tests on Node 22/24/26
+  (run `41055915313`), presubmit (run `41055915234`), and memory-leak test
+  (run `41055915386`).
+- Post-push fetch verified `origin/main` at
+  `86f0b0c2b64c8cf7743fa0c564a512b08a6707d1`; live upstream is an ancestor
+  and upstream missing count is zero.
