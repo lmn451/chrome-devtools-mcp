@@ -39,3 +39,25 @@
 - Post-push fetch verified `origin/main` at
   `86f0b0c2b64c8cf7743fa0c564a512b08a6707d1`; live upstream is an ancestor
   and upstream missing count is zero.
+
+## 2026-11-03 — upstream sync
+
+- Merged upstream `81a037939b19a3588ac6a35e06d576af706a3b57` as
+  `b90ce1422dc93b514d7a8d61360a4e1dfd224708`. Resolved the
+  `src/ToolHandler.ts` conflict by retaining fork resource-loader and shared
+  page trace guards while adding upstream non-Error exception normalization;
+  also merged the upstream whitespace-sensitive snapshot fix and dependency
+  updates.
+- Local verification passed: `npm run sync`, build, CLI/docs/metrics
+  generation, format/check-format, focused ToolHandler/snapshot/proxy/HTTP/
+  telemetry/performance tests, full serial suites on Node 22.21.1, 24.11.1,
+  and 26.7.0, bundle, notices, and the 1% memory profile (maximum measured
+  growth 0.60%). Bundle emitted non-fatal Rollup `this`/circular-dependency
+  warnings.
+- Exact-SHA Actions passed on `b90ce142`: compile/tests on Node 22/24/26
+  (run `41673856433`), presubmit (run `41673856428`), and memory-leak test
+  (run `41673856732`). Sync workflow run `41675056247` passed after the
+  scheduled run `41658702216` reported the now-resolved ToolHandler conflict.
+- Post-push fetch verified `origin/main` at
+  `b90ce1422dc93b514d7a8d61360a4e1dfd224708`; live upstream is an ancestor
+  and upstream missing count is zero.
