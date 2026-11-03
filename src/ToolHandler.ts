@@ -33,7 +33,7 @@ import {
   type FileVerificationOption,
   type ToolDefinition,
 } from './tools/ToolDefinition.js';
-import {getErrorMessage} from './utils/errorHandling.js';
+import {getErrorMessage, toError} from './utils/errorHandling.js';
 import {
   getPageMutationBlockMessage,
   withPerformanceTracePageLock,
@@ -388,7 +388,7 @@ export class ToolHandler {
       await validateToolFiles(tool, params, context, true);
       await tool.handler({params}, response, context);
     } catch (err) {
-      response.setError(err);
+      response.setError(toError(err));
     }
     return await response.handle(
       context,
@@ -469,7 +469,7 @@ export class ToolHandler {
         );
       }
     } catch (err) {
-      response.setError(err);
+      response.setError(toError(err));
     }
     onTelemetryData(
       await context.getDevToolsData(page),
@@ -577,7 +577,10 @@ export class ToolHandler {
       return result;
     } catch (err) {
       logger?.(`${tool.name} error:`, err, err?.stack);
-      let errorText = err && 'message' in err ? err.message : String(err);
+      let errorText =
+        err && typeof err === 'object' && 'message' in err
+          ? err.message
+          : String(err);
       let cause: unknown =
         err && typeof err === 'object' && 'cause' in err
           ? err.cause
