@@ -61,3 +61,12 @@
 - Post-push fetch verified `origin/main` at
   `b90ce1422dc93b514d7a8d61360a4e1dfd224708`; live upstream is an ancestor
   and upstream missing count is zero.
+
+## 2026-11-04 — upstream sync
+
+- Fresh fetch: `origin/main` `c0f8b729e7025e7a4627126dc62f106a261851ae`; `upstream/main` `0877ee00d2e43c1c04bba275e7d08cc1033e36e9`, including the frontend pin update to `473d7d4` and logpoints feature.
+- Merged upstream as `8523b00bac20bf3799f7aa93cb5fc57c126bf3a5`. Resolved the `src/McpPage.ts` conflict by retaining fork async trace/disposal behavior and upstream logpoint manager lifecycle; frontend gitlink matches upstream.
+- Local verification passed: `npm run sync`, build, CLI/docs/metrics generation, format/diff checks, bundle, notices (2 passed), and focused logpoint/McpPage/console tests (169 passed). Rollup emitted non-fatal `this`/circular-dependency warnings.
+- Local browser caveat: APK Chromium was `156.0.8078.79`, not the cached Puppeteer-pinned `156.0.8078.47`; on the APK build, the shared-page HTTP screenshot test timed out and the very tall full-page screenshot returned `Page is too large`. The pinned browser could not launch under gcompat (`unsupported relocation type 1032`), so these local browser results are not treated as code-pass evidence.
+- Exact-SHA Actions passed on `8523b00`: compile/tests on Node 22/24/26 and required tests (run `41911866592`); presubmit format/docs checks (run `41911866544`); memory-leak tests (run `41911866571`). All runs completed successfully on the exact SHA.
+- Post-push fetch verified `origin/main` at `8523b00bac20bf3799f7aa93cb5fc57c126bf3a5`; live `upstream/main` is an ancestor and upstream missing count is zero.
