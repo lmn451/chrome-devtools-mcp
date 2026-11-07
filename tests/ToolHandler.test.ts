@@ -17,6 +17,9 @@ import {ConfigParser} from '../src/config/ConfigParser.js';
 import type {McpContext} from '../src/McpContext.js';
 import {McpResponse, type DataFormat} from '../src/McpResponse.js';
 import {ClearcutLogger} from '../src/telemetry/ClearcutLogger.js';
+import {FilePersistence} from '../src/telemetry/persistence.js';
+import {McpClient, WatchdogMessageType} from '../src/telemetry/types.js';
+import {WatchdogClient} from '../src/telemetry/WatchdogClient.js';
 import {
   ProtocolError,
   ProtocolErrorCode,
@@ -24,6 +27,8 @@ import {
 } from '../src/third_party/index.js';
 import {TOOL_CALL_TIMEOUT_MS, ToolHandler} from '../src/ToolHandler.js';
 import {ToolCategory} from '../src/tools/categories.js';
+import {emulate} from '../src/tools/emulation.js';
+import {pressKey, typeText} from '../src/tools/input.js';
 import {
   defineBrowserlessTool,
   definePageTool,
@@ -934,6 +939,112 @@ describe('ToolHandler', () => {
     }
   });
 
+  it('sanitizes raw validated args for tools with transformed schemas', async () => {
+    sinon.stub(Date, 'now').returns(1000);
+    sinon
+      .stub(McpResponse.prototype, 'handle')
+      .resolves({content: [], structuredContent: {}});
+    const config = parseConfig(['--no-page-id-routing']);
+    const mockContext = createMockMcpContext();
+    mockContext.ensureBrowser.resolves(
+      getMockBrowser({process: sinon.createStubInstance(ChildProcess)}),
+    );
+    const mockPage = createMockPuppeteerPage();
+    Object.defineProperty(mockPage, 'keyboard', {
+      value: {
+        down: sinon.stub().resolves(),
+        press: sinon.stub().resolves(),
+        type: sinon.stub().resolves(),
+        up: sinon.stub().resolves(),
+      },
+    });
+    mockContext.getSelectedMcpPage.returns(
+      createMockMcpPage({pptrPage: mockPage}),
+    );
+    mockContext.getDevToolsData.resolves({});
+
+    const mockPersistence = sinon.createStubInstance(FilePersistence, {
+      loadState: Promise.resolve({lastToolCall: new Date().toISOString()}),
+    });
+    const mockWatchdogClient = sinon.createStubInstance(WatchdogClient);
+    ClearcutLogger.initialize({
+      persistence: mockPersistence,
+      appVersion: '1.0.0',
+      watchdogClient: mockWatchdogClient,
+    });
+    await Promise.resolve();
+
+    const testCases: Array<{
+      tool: DefinedPageTool;
+      rawArgs: Record<string, unknown>;
+      expectedParams: Record<string, unknown>;
+    }> = [
+      {
+        tool: pressKey(config.resolved),
+        rawArgs: {key: 'Control+Shift+C'},
+        expectedParams: {
+          press_key_params: {
+            key_length: 20,
+          },
+        },
+      },
+      {
+        tool: typeText(config.resolved),
+        rawArgs: {text: 'hello', submitKey: ''},
+        expectedParams: {
+          type_text_params: {
+            text_length: 5,
+            submit_key_length: 0,
+          },
+        },
+      },
+      {
+        tool: emulate(config.resolved),
+        rawArgs: {
+          viewport: '400x400x1',
+          geolocation: '37.7749,-122.4194',
+          extraHttpHeaders: '{"X-Custom":"1"}',
+        },
+        expectedParams: {
+          emulate_params: {
+            viewport_length: 10,
+            geolocation_length: 20,
+            extra_http_headers_length: 20,
+          },
+        },
+      },
+    ];
+
+    for (const {tool, rawArgs, expectedParams} of testCases) {
+      mockWatchdogClient.send.resetHistory();
+      const toolHandler = new ToolHandler(
+        tool,
+        config,
+        async () => mockContext,
+        sinon.spy(),
+      );
+
+      const result = await toolHandler.handle(rawArgs);
+
+      assert.strictEqual(result.isError, undefined);
+      sinon.assert.calledOnceWithExactly(mockWatchdogClient.send, {
+        type: WatchdogMessageType.LOG_EVENT,
+        payload: {
+          mcp_client: McpClient.MCP_CLIENT_UNSPECIFIED,
+          tool_invocation: {
+            tool_name: tool.name,
+            success: true,
+            latency_ms: 50,
+            context: {
+              is_devtools_open: false,
+            },
+            tool_params: expectedParams,
+          },
+        },
+      });
+    }
+  });
+
   it('rejects unknown registered tool arguments and sets additionalProperties to false', () => {
     const tool: ToolDefinition = {
       name: 'strict_tool',
@@ -1124,6 +1235,48 @@ describe('ToolHandler', () => {
       sinon.spy(),
     );
     assert.strictEqual(disabledHandler.disabled, true);
+  });
+
+  it('disables set_logpoints when javascriptEvaluation is false', async () => {
+    const mockContext = createMockMcpContext();
+
+    const defaultConfig = parseConfig();
+    const defaultTool = createTools(defaultConfig.resolved).find(
+      t => t.name === 'set_logpoints',
+    );
+    if (!defaultTool) {
+      assert.fail('set_logpoints not found');
+    }
+    const defaultHandler = new ToolHandler(
+      defaultTool,
+      defaultConfig,
+      async () => mockContext,
+      sinon.spy(),
+    );
+    assert.strictEqual(defaultHandler.disabled, false);
+
+    const disabledConfig = parseConfig(['--no-javascript-evaluation']);
+    const disabledTool = createTools(disabledConfig.resolved).find(
+      t => t.name === 'set_logpoints',
+    );
+    if (!disabledTool) {
+      assert.fail('set_logpoints not found');
+    }
+    const disabledHandler = new ToolHandler(
+      disabledTool,
+      disabledConfig,
+      async () => mockContext,
+      sinon.spy(),
+    );
+    assert.strictEqual(disabledHandler.disabled, true);
+    const disabledResult = await disabledHandler.handle({logpoints: []});
+    assert.strictEqual(disabledResult.isError, true);
+    assert.match(
+      disabledResult.content[0].type === 'text'
+        ? disabledResult.content[0].text
+        : '',
+      /Tool set_logpoints requires flag --javascriptEvaluation and is currently disabled/,
+    );
   });
 
   describe('slim mode', () => {

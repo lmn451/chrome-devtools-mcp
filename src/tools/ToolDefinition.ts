@@ -366,6 +366,7 @@ export type Context = Readonly<{
   recordedTraces(): TraceResult[];
   storeTraceRecording(result: TraceResult): void;
   getPageById(pageId: number): ContextPage;
+  getPages(): ContextPage[];
   newPage(
     background?: boolean,
     isolatedContextName?: string,

@@ -21,9 +21,9 @@ describe('THIRD_PARTY_NOTICES', () => {
   });
 
   it('matches snapshot', t => {
-    const noticesPath = path.join(
-      process.cwd(),
-      'build/src/third_party/THIRD_PARTY_NOTICES',
+    const noticesPath = path.resolve(
+      import.meta.dirname,
+      '../src/third_party/THIRD_PARTY_NOTICES',
     );
     if (!fs.existsSync(noticesPath)) {
       throw new Error(
