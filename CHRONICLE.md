@@ -70,3 +70,10 @@
 - Local browser caveat: APK Chromium was `156.0.8078.79`, not the cached Puppeteer-pinned `156.0.8078.47`; on the APK build, the shared-page HTTP screenshot test timed out and the very tall full-page screenshot returned `Page is too large`. The pinned browser could not launch under gcompat (`unsupported relocation type 1032`), so these local browser results are not treated as code-pass evidence.
 - Exact-SHA Actions passed on `8523b00`: compile/tests on Node 22/24/26 and required tests (run `41911866592`); presubmit format/docs checks (run `41911866544`); memory-leak tests (run `41911866571`). All runs completed successfully on the exact SHA.
 - Post-push fetch verified `origin/main` at `8523b00bac20bf3799f7aa93cb5fc57c126bf3a5`; live `upstream/main` is an ancestor and upstream missing count is zero.
+
+## 2026-11-07 — upstream sync
+
+- Fresh fetch: `origin/main` `03a15dbb5d361f65bd2136ed5c01a76bc4a0dfc5`; `upstream/main` `0b37364dc0a88a804c6d73d3335e776adc7f33c4`, 16 commits ahead. Merged upstream as `1beef67d63b0b1e79d00f57f3d01112d568d7fe8`; the DevTools frontend gitlink matches `6629a207ee73e9e18cfa13505b22e3c1ab52f3d6`. Retained fork HTTP/proxy behavior and shared-page trace safeguards while resolving upstream build/test changes.
+- Local checks passed: `npm run sync`, native GN/Ninja build (369/369 targets), CLI/docs/metrics generation, `npm run check-format`, and focused ToolHandler/performance tests. Local Rollup bundle/notices could not complete on the ARM64/musl host (Node heap limit); the pinned Chrome was unavailable locally.
+- Exact-SHA Actions passed on `1beef67`: compile/tests including bundle and notices on Node 22/24/26 (run `42390789920`), presubmit (run `42390790049`), and memory-leak test (run `42390790133`).
+- Post-push fetch verified `origin/main` at `1beef67d63b0b1e79d00f57f3d01112d568d7fe8`; live `upstream/main` is an ancestor and upstream missing count is zero.
