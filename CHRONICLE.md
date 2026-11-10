@@ -77,3 +77,11 @@
 - Local checks passed: `npm run sync`, native GN/Ninja build (369/369 targets), CLI/docs/metrics generation, `npm run check-format`, and focused ToolHandler/performance tests. Local Rollup bundle/notices could not complete on the ARM64/musl host (Node heap limit); the pinned Chrome was unavailable locally.
 - Exact-SHA Actions passed on `1beef67`: compile/tests including bundle and notices on Node 22/24/26 (run `42390789920`), presubmit (run `42390790049`), and memory-leak test (run `42390790133`).
 - Post-push fetch verified `origin/main` at `1beef67d63b0b1e79d00f57f3d01112d568d7fe8`; live `upstream/main` is an ancestor and upstream missing count is zero.
+
+## 2026-11-10 — upstream sync
+
+- Fresh fetch: fork `origin/main` was `007b63200df3e9a9c268da866fdb7d0b0e5dedb0`; upstream `main` was `589f43caa3fabcc8c65f479003d3e9dc779ca78e`. Prepared the merge with DevTools frontend gitlink `ff77a8e8961a0b468d29affea6392eac22a93b5b`.
+- Local checks passed: `gclient sync --nohooks`, GN generation, `npm run build -- -j4` (exit 0; 1,793.5s), CLI/docs/metrics generation, `npm run check-format`, and focused CLI-imports/comments/update-check/URL/config-options/telemetry tests. Temporary ARM/musl and QEMU wrappers were removed; all original binary hashes were verified restored.
+- The full local `test:no-build` suite is not counted as passing: browser tests could not launch the pinned Puppeteer Chrome at `~/.cache/puppeteer/chrome/linux_arm-156.0.8078.47/chrome-linux-arm64/chrome` (ENOENT). Exact-SHA CI must cover browser, bundle/notices, and memory checks.
+- Scheduled sync run `42844890042` merged upstream but its push was rejected when `GITHUB_TOKEN` tried to update `.github/workflows/pre-release.yml` without `workflows` permission. The local authenticated `spacex-hermes` token has workflow scope for this one-time push; future scheduled updates to workflow files need a suitably permissioned GitHub App token or PAT secret.
+- Exact-SHA Actions and post-push live-ref verification pending.
