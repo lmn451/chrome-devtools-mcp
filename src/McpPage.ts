@@ -20,6 +20,15 @@ import type {Logpoint, LogpointOptions} from './LogpointManager.js';
 import {LogpointManager} from './LogpointManager.js';
 import {TextSnapshot} from './TextSnapshot.js';
 import {
+  type NetworkOverrideManager,
+  acquireNetworkOverrideManager,
+  reconcileNetworkOverrideManager,
+  releaseNetworkOverrideManager,
+  type NetworkOverride,
+  type NetworkMockFilter,
+  type NetworkMockInput,
+} from './NetworkOverrideManager.js';
+import {
   type Locator,
   PredefinedNetworkConditions,
   type Dialog,
@@ -59,6 +68,8 @@ import type {
 } from './types.js';
 import {getErrorMessage} from './utils/errorHandling.js';
 import {
+  getPageMutationBlockMessage,
+  isPerformanceTraceOwnedByAnotherSession,
   ownsPerformanceTrace,
   releasePerformanceTrace,
   stopOwnedPerformanceTrace,
@@ -235,6 +246,7 @@ export class McpPage implements ContextPage {
   #config: ReadonlyServerConfig;
   #commentBridge?: DevToolsCommentBridge;
   #loadResource?: (url: string) => Promise<string>;
+  #networkOverrideManager?: NetworkOverrideManager;
 
   constructor(
     target: Target,
@@ -378,6 +390,15 @@ export class McpPage implements ContextPage {
         return;
       }
       this.#pptrPage = page;
+      const networkOverrideManager = await acquireNetworkOverrideManager(
+        page,
+        this,
+      );
+      if (this.#disposed || page.isClosed()) {
+        await releaseNetworkOverrideManager(page, this);
+        return;
+      }
+      this.#networkOverrideManager = networkOverrideManager;
       page.on('dialog', this.#dialogHandler);
       this.#networkCollector = new NetworkCollector(page, {
         maxNavigationSaved: this.#config.resolved.maxNavigationSaved,
@@ -973,6 +994,16 @@ export class McpPage implements ContextPage {
     this.#webAuthnAuthenticator = undefined;
     devtoolsUniverse?.universe.dispose();
 
+    const waitForInit = async (): Promise<void> => {
+      if (initPromise) {
+        try {
+          await initPromise;
+        } catch (e) {
+          logger?.('Failed to finish page initialization during dispose', e);
+        }
+      }
+    };
+
     this.#disposePromise = (async (): Promise<void> => {
       if (pptrPage) {
         await withPerformanceTracePageLock(pptrPage, async () => {
@@ -986,14 +1017,33 @@ export class McpPage implements ContextPage {
             }
           }
           releasePerformanceTrace(pptrPage, this);
+          await waitForInit();
+
+          if (this.#networkOverrideManager) {
+            this.#networkOverrideManager = undefined;
+            const deferDeactivation = isPerformanceTraceOwnedByAnotherSession(
+              pptrPage,
+              this,
+            );
+            try {
+              await releaseNetworkOverrideManager(pptrPage, this, {
+                deferDeactivation,
+              });
+            } catch (e) {
+              logger?.('Failed to release network mocks on page dispose', e);
+            }
+          }
+
+          if (!isPerformanceTraceOwnedByAnotherSession(pptrPage, this)) {
+            try {
+              await reconcileNetworkOverrideManager(pptrPage);
+            } catch (e) {
+              logger?.('Failed to reconcile network mocks on page dispose', e);
+            }
+          }
         });
-      }
-      if (initPromise) {
-        try {
-          await initPromise;
-        } catch (e) {
-          logger?.('Failed to finish page initialization during dispose', e);
-        }
+      } else if (initPromise) {
+        await waitForInit();
       }
       if (recorder) {
         try {
@@ -1009,6 +1059,43 @@ export class McpPage implements ContextPage {
       }
     })();
     return await this.#disposePromise;
+  }
+
+  async mockNetwork(input: NetworkMockInput): Promise<NetworkOverride> {
+    const manager = await this.#getNetworkOverrideManagerForChanges();
+    return await manager.mock(input, this);
+  }
+
+  async #getNetworkOverrideManagerForChanges(): Promise<NetworkOverrideManager> {
+    if (this.#isRunningPerformanceTrace) {
+      throw new Error(
+        'Cannot change network mocks while a performance trace is running.',
+      );
+    }
+    if (this.#pptrPage) {
+      const blockMessage = getPageMutationBlockMessage(this.#pptrPage, this);
+      if (blockMessage) {
+        throw new Error(blockMessage);
+      }
+    }
+    await this.init();
+    if (!this.#networkOverrideManager) {
+      throw new Error(`McpPage (id=${this.id}) is not initialized.`);
+    }
+    const blockMessage = getPageMutationBlockMessage(this.pptrPage, this);
+    if (blockMessage) {
+      throw new Error(blockMessage);
+    }
+    return this.#networkOverrideManager;
+  }
+
+  listNetworkMocks(filter?: NetworkMockFilter): NetworkOverride[] {
+    return this.#networkOverrideManager?.list(filter, this) ?? [];
+  }
+
+  async removeNetworkMocks(filter: NetworkMockFilter): Promise<number> {
+    const manager = await this.#getNetworkOverrideManagerForChanges();
+    return await manager.remove(filter, this);
   }
 
   async executeThirdPartyDeveloperTool(

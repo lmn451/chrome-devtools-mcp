@@ -26,6 +26,7 @@ import type {TextSnapshotNode} from '../src/types.js';
 import {
   createMockCDPSession,
   createMockDialog,
+  createMockHTTPRequest,
   createMockMcpResponse,
   createMockPuppeteerPage,
   createMockPuppeteerTarget,
@@ -287,6 +288,197 @@ describe('replaceHtmlElementsWithUids', () => {
 });
 
 describe('McpPage', () => {
+  describe('network overrides', () => {
+    it('rejects changing overrides during recording and allows clearing after stopping', async () => {
+      const pptrPage = createMockPuppeteerPage();
+      const page = new McpPage(createMockPuppeteerTarget({page: pptrPage}), 1, {
+        config: createMockServerConfig(),
+        locatorClass: Locator,
+      });
+      await page.mockNetwork({
+        kind: 'file',
+        urlPattern: '*://*:*/*.js',
+        responseFilePath: '/tmp/app.js',
+        loadResponseFile: async () => new Uint8Array(),
+      });
+      page.setIsRunningPerformanceTrace(true);
+      await assert.rejects(
+        page.mockNetwork({
+          urlPattern: '*://*:*/*.js',
+          kind: 'file',
+          responseFilePath: '/tmp/app.js',
+          loadResponseFile: async () => new Uint8Array(),
+        }),
+        /trace is running/,
+      );
+      await assert.rejects(page.removeNetworkMocks({}), /trace is running/);
+      page.setIsRunningPerformanceTrace(false);
+      await page.removeNetworkMocks({});
+      assert.deepStrictEqual(page.listNetworkMocks(), []);
+      page.dispose();
+    });
+    it('initializes interception and releases it when overrides are cleared', async () => {
+      const pptrPage = createMockPuppeteerPage();
+      const page = new McpPage(createMockPuppeteerTarget({page: pptrPage}), 1, {
+        config: createMockServerConfig(),
+        locatorClass: Locator,
+      });
+      const overrides = await page.mockNetwork({
+        kind: 'file',
+        urlPattern: '*://*:*/*.js',
+        responseFilePath: '/tmp/replacement.js',
+        loadResponseFile: async () => new Uint8Array(),
+      });
+      assert.deepStrictEqual(page.listNetworkMocks(), [overrides]);
+      sinon.assert.calledOnceWithExactly(pptrPage.setCacheEnabled, false);
+      sinon.assert.calledOnceWithExactly(pptrPage.setRequestInterception, true);
+      await page.removeNetworkMocks({});
+      assert.deepStrictEqual(page.listNetworkMocks(), []);
+      sinon.assert.calledWithExactly(
+        pptrPage.setRequestInterception.secondCall,
+        false,
+      );
+      sinon.assert.calledWithExactly(pptrPage.setCacheEnabled.secondCall, true);
+      page.dispose();
+    });
+
+    it('rejects setting overrides after disposal', async () => {
+      const pptrPage = createMockPuppeteerPage();
+      const page = new McpPage(createMockPuppeteerTarget({page: pptrPage}), 1, {
+        config: createMockServerConfig(),
+        locatorClass: Locator,
+      });
+      page.dispose();
+      await assert.rejects(
+        page.mockNetwork({
+          kind: 'file',
+          urlPattern: '*://*:*/*.js',
+          responseFilePath: '/tmp/replacement.js',
+          loadResponseFile: async () => new Uint8Array(),
+        }),
+        /already been disposed/,
+      );
+      sinon.assert.notCalled(pptrPage.setRequestInterception);
+    });
+
+    it('filters and removes network mocks without clearing unrelated routes', async () => {
+      const pptrPage = createMockPuppeteerPage();
+      const page = new McpPage(createMockPuppeteerTarget({page: pptrPage}), 1, {
+        config: createMockServerConfig(),
+        locatorClass: Locator,
+      });
+      const script = await page.mockNetwork({
+        urlPattern: '*://*:*/*app.js',
+        resourceType: 'script',
+        kind: 'file',
+        responseFilePath: '/tmp/app.js',
+        loadResponseFile: async () => new Uint8Array(),
+      });
+      await page.mockNetwork({
+        resourceType: 'image',
+        kind: 'file',
+        responseFilePath: '/tmp/app.js',
+        loadResponseFile: async () => new Uint8Array(),
+      });
+      assert.deepStrictEqual(page.listNetworkMocks({resourceType: 'script'}), [
+        script,
+      ]);
+      assert.equal(await page.removeNetworkMocks({resourceType: 'image'}), 1);
+      assert.deepStrictEqual(page.listNetworkMocks(), [script]);
+      sinon.assert.calledOnceWithExactly(pptrPage.setRequestInterception, true);
+      await page.removeNetworkMocks({});
+      page.dispose();
+    });
+
+    it('shares interception and owner cleanup across wrappers of the same Page', async () => {
+      const pptrPage = createMockPuppeteerPage();
+      const firstPage = new McpPage(
+        createMockPuppeteerTarget({page: pptrPage}),
+        1,
+        {config: createMockServerConfig(), locatorClass: Locator},
+      );
+      const secondPage = new McpPage(
+        createMockPuppeteerTarget({page: pptrPage}),
+        2,
+        {config: createMockServerConfig(), locatorClass: Locator},
+      );
+      const firstBody = new Uint8Array([1]);
+      const secondBody = new Uint8Array([2]);
+
+      try {
+        await firstPage.init();
+        await secondPage.init();
+        const listenersBeforeMocks = pptrPage.listenerCount('request');
+        const firstOverride = await firstPage.mockNetwork({
+          kind: 'file',
+          urlPattern: '*://*:*/*first.js',
+          responseFilePath: '/first-root/first.js',
+          loadResponseFile: async () => firstBody,
+        });
+        const secondOverride = await secondPage.mockNetwork({
+          kind: 'file',
+          urlPattern: '*://*:*/*second.js',
+          responseFilePath: '/second-root/second.js',
+          loadResponseFile: async () => secondBody,
+        });
+
+        assert.deepStrictEqual(firstPage.listNetworkMocks(), [firstOverride]);
+        assert.deepStrictEqual(secondPage.listNetworkMocks(), [secondOverride]);
+        assert.strictEqual(
+          pptrPage.listenerCount('request'),
+          listenersBeforeMocks + 1,
+        );
+        sinon.assert.calledOnceWithExactly(pptrPage.setCacheEnabled, false);
+        sinon.assert.calledOnceWithExactly(
+          pptrPage.setRequestInterception,
+          true,
+        );
+
+        const requestHandler = pptrPage.on
+          .getCalls()
+          .filter(call => call.args[0] === 'request')
+          .at(-1)?.args[1];
+        if (typeof requestHandler !== 'function') {
+          throw new Error('Shared request handler was not installed.');
+        }
+        const firstRequest = createMockHTTPRequest({
+          url: 'https://example.com/first.js',
+        });
+        await requestHandler(firstRequest);
+        assert.strictEqual(
+          firstRequest.respond.firstCall.args[0].body,
+          firstBody,
+        );
+
+        await firstPage.disposeAsync();
+        assert.deepStrictEqual(firstPage.listNetworkMocks(), []);
+        assert.deepStrictEqual(secondPage.listNetworkMocks(), [secondOverride]);
+        assert.strictEqual(pptrPage.setRequestInterception.callCount, 1);
+        const secondRequest = createMockHTTPRequest({
+          url: 'https://example.com/second.js',
+        });
+        await requestHandler(secondRequest);
+        assert.strictEqual(
+          secondRequest.respond.firstCall.args[0].body,
+          secondBody,
+        );
+
+        await secondPage.removeNetworkMocks({});
+        sinon.assert.calledWithExactly(
+          pptrPage.setRequestInterception.secondCall,
+          false,
+        );
+        sinon.assert.calledWithExactly(
+          pptrPage.setCacheEnabled.secondCall,
+          true,
+        );
+      } finally {
+        await firstPage.disposeAsync();
+        await secondPage.disposeAsync();
+      }
+    });
+  });
+
   async function createMcpPage(options: {config?: ReadonlyServerConfig} = {}) {
     const pptrPage = createMockPuppeteerPage();
     pptrPage.emulateFocusedPage.resolves();

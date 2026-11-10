@@ -15,10 +15,16 @@ import {
   type TraceResult,
 } from '../processors/PerformanceTrace.js';
 import {logger} from '../utils/logger.js';
+import {NetworkOverridesFormatter} from '../formatters/NetworkOverridesFormatter.js';
+import {
+  listNetworkOverrides,
+  reconcileNetworkOverrideManager,
+} from '../NetworkOverrideManager.js';
 import {
   markPerformanceTraceSetupComplete,
   ownsPerformanceTrace,
   PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE,
+  PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
   PERFORMANCE_TRACE_PAGE_CLOSING_MESSAGE,
   tryWithPerformanceTraceGlobalLock,
   withPerformanceTracePageLock,
@@ -117,6 +123,14 @@ export const startTrace: PageToolFactory = definePageTool(() => ({
         return false;
       }
 
+      const networkOverrides = listNetworkOverrides(pptrPage);
+      const {warning} = new NetworkOverridesFormatter(
+        networkOverrides,
+      ).toJSON();
+      if (warning) {
+        response.appendResponseLine(warning);
+      }
+
       let traceStartedByThisCall = false;
       let cacheDisabled = false;
       let blankPageNavigated = false;
@@ -158,7 +172,9 @@ export const startTrace: PageToolFactory = definePageTool(() => ({
         ensureTraceSetupCanContinue();
 
         if (request.params.reload) {
-          const ignoreCache = request.params.ignoreCache ?? false;
+          const ignoreCache =
+            (request.params.ignoreCache ?? false) &&
+            networkOverrides.length === 0;
           try {
             if (ignoreCache) {
               // Disable the HTTP cache so that the main document and all
@@ -219,6 +235,14 @@ export const startTrace: PageToolFactory = definePageTool(() => ({
             }
           } finally {
             releasePerformanceTrace(pptrPage, page);
+            try {
+              await reconcileNetworkOverrideManager(pptrPage);
+            } catch (reconcileError) {
+              logger?.(
+                'Failed to reconcile network mocks after trace setup failed',
+                reconcileError,
+              );
+            }
           }
         }
         if (error === pageClosedDuringTraceSetup) {
@@ -302,6 +326,18 @@ export const stopTrace: PageToolFactory = definePageTool(
             `Error: the active performance trace is running${pageHint}, not on page ${page.id}. ${actionHint}`,
           );
           return;
+        }
+        if (!ownsPerformanceTrace(page.pptrPage, page)) {
+          response.appendResponseLine(
+            PERFORMANCE_TRACE_OWNED_BY_ANOTHER_SESSION_MESSAGE,
+          );
+          return;
+        }
+        const {warning} = new NetworkOverridesFormatter(
+          listNetworkOverrides(page.pptrPage),
+        ).toJSON();
+        if (warning) {
+          response.appendResponseLine(warning);
         }
         await stopTracingAndAppendOutput(
           page,
@@ -410,6 +446,11 @@ async function stopTracingAndAppendOutput(
       page.setIsRunningPerformanceTrace(false);
     } finally {
       releasePerformanceTrace(page.pptrPage, page);
+      try {
+        await reconcileNetworkOverrideManager(page.pptrPage);
+      } catch (error) {
+        logger?.('Failed to reconcile network mocks after trace stop', error);
+      }
     }
   }
 }

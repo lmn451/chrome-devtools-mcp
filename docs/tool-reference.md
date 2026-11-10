@@ -56,6 +56,9 @@
   - [`get_heapsnapshot_retaining_paths`](#get_heapsnapshot_retaining_paths)
   - [`get_heapsnapshot_summary`](#get_heapsnapshot_summary)
   - [`query_heapsnapshot_objects`](#query_heapsnapshot_objects)
+- **[Network mocks](#network-mocks)** (2 tools)
+  - [`mock_network`](#mock_network)
+  - [`remove_network_mock`](#remove_network_mock)
 - **[Extensions](#extensions)** (5 tools)
   - [`install_extension`](#install_extension)
   - [`list_extensions`](#list_extensions)
@@ -717,6 +720,35 @@ in the DevTools Elements panel (if any).
 
 ---
 
+## Network mocks
+
+> NOTE: The Network mocks category is not active by default. Use the '--categoryNetworkMocks' flag.
+
+### `mock_network`
+
+**Description:** Inspect or update network mocks for a page. With no actions, list mocks matching the supplied filters, or all mocks when no filters are given. Providing body updates the exact route/resourceType pair. An omitted route matches any URL. Other mocks are preserved. The most recently updated matching mock wins and persists across navigations. Configure before navigating or reloading; inspection shows hit counts and replacement errors. Changes are rejected during a performance trace. Mocks disable the page HTTP cache and intercept every request, affecting measurements. Service workers can bypass mocks. Use [`remove_network_mock`](#remove_network_mock) to remove mocks. (requires flag: --categoryNetworkMocks=true)
+
+**Parameters:**
+
+- **pageId** (number) **(required)**: Targets a specific page by ID.
+- **body** (string) _(optional)_: Local response body file, revalidated and reread for every request. Content-Type follows its extension.
+- **resourceType** (enum: "document", "stylesheet", "image", "media", "font", "script", "texttrack", "xhr", "fetch", "prefetch", "eventsource", "manifest", "signedexchange", "ping", "cspviolationreport", "preflight", "fedcm", "other") _(optional)_: Restrict requests and stored mock filters to this resource type. Omit to inspect/remove all types or configure a mock for any type.
+- **route** (string) _(optional)_: Absolute URLPattern, e.g. https://example.com/app.js or `*://*:*/app.js`. Use `*` for wildcards; omitted query strings match any query. Regex and `:name` groups are rejected. Inspection and removal compare the stored pattern exactly. Omit to inspect/remove all routes or match any URL.
+
+---
+
+### `remove_network_mock`
+
+**Description:** Remove network mocks matching the supplied stored route and/or resource type. Route patterns are compared exactly, not applied as wildcards to other patterns. Omit both filters to remove all mocks for the page. Removing the last mock restores the HTTP cache and stops interception. Changes are rejected during a performance trace. (requires flag: --categoryNetworkMocks=true)
+
+**Parameters:**
+
+- **pageId** (number) **(required)**: Targets a specific page by ID.
+- **resourceType** (enum: "document", "stylesheet", "image", "media", "font", "script", "texttrack", "xhr", "fetch", "prefetch", "eventsource", "manifest", "signedexchange", "ping", "cspviolationreport", "preflight", "fedcm", "other") _(optional)_: Restrict requests and stored mock filters to this resource type. Omit to inspect/remove all types or configure a mock for any type.
+- **route** (string) _(optional)_: Absolute URLPattern, e.g. https://example.com/app.js or `*://*:*/app.js`. Use `*` for wildcards; omitted query strings match any query. Regex and `:name` groups are rejected. Inspection and removal compare the stored pattern exactly. Omit to inspect/remove all routes or match any URL.
+
+---
+
 ## Extensions
 
 > NOTE: The Extensions category is not active by default. Use the '--categoryExtensions' flag.
@@ -733,7 +765,7 @@ in the DevTools Elements panel (if any).
 
 ### `list_extensions`
 
-**Description:** Lists all the Chrome extensions installed in the browser. This includes their name, ID, version, and enabled status. (requires flag: --categoryExtensions=true)
+**Description:** Lists the unpacked Chrome extensions loaded in the browser. This includes their name, ID, version, and enabled status. Extensions installed from the Chrome Web Store are not included. (requires flag: --categoryExtensions=true)
 
 **Parameters:** None
 
