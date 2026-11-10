@@ -545,7 +545,9 @@ describe('McpContext', () => {
 
     // First snapshot: thirdPage triggers a fallback to firstPage (recording
     // wasClosed: false on the third isClosed() call so it is distinguishable
-    // from the second fallback).
+    // from the second fallback). `init()` already called isClosed(), so reset
+    // the stub history before defining the snapshot's call sequence.
+    thirdPptrPage.isClosed.resetHistory();
     thirdPptrPage.isClosed
       .onFirstCall()
       .returns(true)
