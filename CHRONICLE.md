@@ -93,3 +93,11 @@
 - The first pushed merge SHA exposed a test-fixture call-sequence bug: `init()` had already called `isClosed()` before the Sinon sequence was configured. Reset stub history in `tests/McpContext.test.ts`; the focused test passed locally. Follow-up commit: `2f021095759340a573138fd51b00c1eac2b686a6`.
 - Exact-SHA Actions passed on `2f02109`: compile/tests including browser, bundle, and notices on Node 22/24/26 (run `42914575378`); docs and format presubmit (`42914575203`); memory-leak tests (`42914575149`).
 - Post-push fetch verified `origin/main` at `2f021095759340a573138fd51b00c1eac2b686a6`; live `upstream/main` `1d692d31ae370105afcf4d826dc36f1c4c22e21a` is an ancestor, with zero upstream commits missing (65 fork-only commits ahead).
+
+## 2026-11-12 — upstream sync (CI blocked)
+
+- Merged upstream `83d2ba4dde9663a8cd0bdb8af6c99fea50726003` as `93e151142b57604ed1f135d81046755c6636d357` (parents: prior fork `ab1421e126baaf654abe70f000d55c7d6a9ed357` and upstream `83d2ba4...`). The DevTools frontend gitlink advanced from `a61ed5b9cf3d1c4aabfa2152ba6b0c994509f148` to `9f531666ae03a6b42faf12b038e45b0b80d286c8`; fork HTTP/proxy/resource-loader and shared-page lifecycle behavior were retained.
+- Local checks passed: `npm run sync`, build/bundle, CLI/docs/metrics generation, `npm run format`, `npm run check-format`, `npm run test:notices:no-build`, and the focused mock-only suite (396 tests). The full browser-dependent suite is not counted as passing: pinned Puppeteer Chrome `157.0.8103.50` was unavailable on the AArch64/musl host.
+- Independent static review of patch SHA-256 `1e197c42f32b12f05c64f9e6cc7703bfda0a31a0d2ac7b77d76c93dc50466ae1` passed with no security concerns or logic errors; two non-blocking suggestions remain (incomplete smaps measurements; treating retrieved DevTools comments as untrusted).
+- Exact-SHA GitHub Actions runs: none. Workflow dispatch returned HTTP 422, “Actions has been disabled for this repository”; the current token cannot read/change Actions policy (403). Exact-SHA CI remains unavailable, so this sync is not considered fully validated.
+- Fresh fetch verified `origin/main` at `93e151142b57604ed1f135d81046755c6636d357`, `upstream/main` at `83d2ba4dde9663a8cd0bdb8af6c99fea50726003`, upstream is an ancestor, and zero upstream commits are missing (67 fork-only commits ahead).
