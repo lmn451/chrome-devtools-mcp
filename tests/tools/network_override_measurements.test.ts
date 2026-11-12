@@ -21,7 +21,11 @@ import {
   releasePerformanceTrace,
   tryClaimPerformanceTrace,
 } from '../../src/utils/PerformanceTraceRegistry.js';
-import {createHandlerMocks, createMockRunnerResult} from '../mocks.js';
+import {
+  createHandlerMocks,
+  createMockRunnerResult,
+  createMockServerConfig,
+} from '../mocks.js';
 import {loadTraceAsBuffer} from '../trace-processing/fixtures/load.js';
 
 describe('network override measurements', () => {
@@ -42,10 +46,14 @@ describe('network override measurements', () => {
     page: ReturnType<typeof createHandlerMocks>['page'],
   ): Promise<() => Promise<void>> {
     const owner = page;
-    const manager = await acquireNetworkOverrideManager(page.pptrPage, owner);
+    const manager = await acquireNetworkOverrideManager(
+      page.pptrPage,
+      owner,
+      createMockServerConfig(),
+    );
     const override = overrides[0];
-    if (!override) {
-      throw new Error('Expected a test network override.');
+    if (!override || override.kind !== 'file') {
+      throw new Error('Expected a file test network override.');
     }
     await manager.mock(
       {

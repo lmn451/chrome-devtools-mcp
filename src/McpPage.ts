@@ -393,6 +393,7 @@ export class McpPage implements ContextPage {
       const networkOverrideManager = await acquireNetworkOverrideManager(
         page,
         this,
+        this.#config,
       );
       if (this.#disposed || page.isClosed()) {
         await releaseNetworkOverrideManager(page, this);
@@ -1063,7 +1064,7 @@ export class McpPage implements ContextPage {
 
   async mockNetwork(input: NetworkMockInput): Promise<NetworkOverride> {
     const manager = await this.#getNetworkOverrideManagerForChanges();
-    return await manager.mock(input, this);
+    return await manager.mock(input, this, this.#config);
   }
 
   async #getNetworkOverrideManagerForChanges(): Promise<NetworkOverrideManager> {

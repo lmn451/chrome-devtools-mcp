@@ -7,22 +7,41 @@
 import path from 'node:path';
 
 import {URLPattern} from './third_party/cli.js';
+import type {ReadonlyServerConfig} from './config/ServerConfig.js';
+import {
+  fetchWithValidatedRedirects,
+  getRedirectHeaders,
+  validateNetworkUrl,
+} from './utils/network.js';
+
 import {
   type HTTPRequest,
   Mutex,
   type Page,
   type ResourceType,
 } from './third_party/index.js';
-import {logger} from './utils/logger.js';
+import {logger, redactUrlForLogging} from './utils/logger.js';
 
 interface BaseNetworkOverride {
   urlPattern: string;
   resourceType?: ResourceType;
+  abort?: boolean;
+  allowOrigin?: string;
 }
 
 export interface NetworkMockFilter {
   urlPattern?: string;
   resourceType?: ResourceType;
+}
+
+interface NetworkMockActions {
+  abort?: boolean;
+  allowOrigin?: string;
+}
+
+export interface UpstreamNetworkOverrideInput extends NetworkMockFilter {
+  kind: 'upstream';
+  upstreamUrl: string;
 }
 
 export interface FileNetworkOverrideInput extends NetworkMockFilter {
@@ -32,7 +51,12 @@ export interface FileNetworkOverrideInput extends NetworkMockFilter {
   loadResponseFile: () => Promise<Uint8Array<ArrayBufferLike>>;
 }
 
-export type NetworkMockInput = FileNetworkOverrideInput;
+export type NetworkMockInput = NetworkMockActions &
+  (
+    | UpstreamNetworkOverrideInput
+    | FileNetworkOverrideInput
+    | (NetworkMockFilter & {kind?: undefined})
+  );
 
 interface NetworkOverrideBase extends BaseNetworkOverride {
   id: number;
@@ -44,17 +68,33 @@ interface NetworkOverrideBase extends BaseNetworkOverride {
   };
 }
 
+export interface UpstreamNetworkOverride extends NetworkOverrideBase {
+  kind: 'upstream';
+  upstreamUrl: string;
+}
+
 export interface FileNetworkOverride extends NetworkOverrideBase {
   kind: 'file';
   responseFilePath: string;
   contentType: string;
 }
 
-export type NetworkOverride = FileNetworkOverride;
+export interface PassthroughNetworkOverride extends NetworkOverrideBase {
+  kind: 'passthrough';
+}
+
+export type NetworkOverride =
+  UpstreamNetworkOverride | FileNetworkOverride | PassthroughNetworkOverride;
 
 interface StoredNetworkOverrideBase extends NetworkOverrideBase {
   matcher: URLPattern;
   owner: object;
+  config: ReadonlyServerConfig;
+}
+
+interface StoredUpstreamNetworkOverride extends StoredNetworkOverrideBase {
+  kind: 'upstream';
+  upstreamUrl: string;
 }
 
 interface StoredFileNetworkOverride extends StoredNetworkOverrideBase {
@@ -64,7 +104,10 @@ interface StoredFileNetworkOverride extends StoredNetworkOverrideBase {
   loadResponseFile: () => Promise<Uint8Array<ArrayBufferLike>>;
 }
 
-type StoredNetworkOverride = StoredFileNetworkOverride;
+type StoredNetworkOverride =
+  | StoredUpstreamNetworkOverride
+  | StoredFileNetworkOverride
+  | (StoredNetworkOverrideBase & {kind: 'passthrough'});
 
 const DEFAULT_URL_PATTERN = '*://*:*/*';
 const DEFAULT_NETWORK_MOCK_OWNER = {};
@@ -100,8 +143,20 @@ function toNetworkOverride(override: StoredNetworkOverride): NetworkOverride {
     id: override.id,
     urlPattern: override.urlPattern,
     resourceType: override.resourceType,
+    abort: override.abort,
+    allowOrigin: override.allowOrigin,
     diagnostics: {...override.diagnostics},
   };
+  if (override.kind === 'upstream') {
+    return {
+      ...base,
+      kind: override.kind,
+      upstreamUrl: override.upstreamUrl,
+    };
+  }
+  if (override.kind === 'passthrough') {
+    return {...base, kind: override.kind};
+  }
   return {
     ...base,
     kind: override.kind,
@@ -152,20 +207,27 @@ export class NetworkOverrideManager {
     return this.#handleRequest(request);
   };
 
-  constructor(page: Page) {
+  constructor(
+    page: Page,
+    private readonly config: ReadonlyServerConfig,
+  ) {
     this.#page = page;
   }
 
   async mock(
     input: NetworkMockInput,
     owner: object = DEFAULT_NETWORK_MOCK_OWNER,
+    config: ReadonlyServerConfig = this.config,
   ): Promise<NetworkOverride> {
-    return await this.#runLifecycleOperation(() => this.#mock(input, owner));
+    return await this.#runLifecycleOperation(() =>
+      this.#mock(input, owner, config),
+    );
   }
 
   async #mock(
     input: NetworkMockInput,
     owner: object,
+    config: ReadonlyServerConfig,
   ): Promise<NetworkOverride> {
     if (this.#disposed) {
       throw new Error('Cannot update mocks after the page was disposed.');
@@ -177,7 +239,7 @@ export class NetworkOverrideManager {
         override.urlPattern === urlPattern &&
         override.resourceType === input.resourceType,
     );
-    const override = await this.#createOverride(input, owner, existing);
+    const override = await this.#createOverride(input, owner, config, existing);
     if (this.#disposed) {
       throw new Error('Cannot update mocks after the page was disposed.');
     }
@@ -201,6 +263,7 @@ export class NetworkOverrideManager {
   async #createOverride(
     input: NetworkMockInput,
     owner: object,
+    config: ReadonlyServerConfig,
     existing?: StoredNetworkOverride,
   ): Promise<StoredNetworkOverride> {
     const urlPattern = input.urlPattern ?? DEFAULT_URL_PATTERN;
@@ -208,20 +271,41 @@ export class NetworkOverrideManager {
       id: existing?.id ?? this.#nextId,
       urlPattern,
       resourceType: input.resourceType,
+      abort: input.abort ?? existing?.abort ?? false,
+      allowOrigin: input.allowOrigin ?? existing?.allowOrigin,
       matcher: new URLPattern(urlPattern),
       owner,
+      config,
       diagnostics: {hits: 0, errors: 0, navigations: 0},
     };
-
-    await input.loadResponseFile();
-    return {
-      ...base,
-      kind: input.kind,
-      responseFilePath: input.responseFilePath,
-      contentType:
-        input.contentType ?? inferContentType(input.responseFilePath),
-      loadResponseFile: input.loadResponseFile,
-    };
+    if (input.kind === 'upstream') {
+      validateNetworkUrl(new URL(input.upstreamUrl), config.resolved);
+      return {
+        ...base,
+        kind: input.kind,
+        upstreamUrl: input.upstreamUrl,
+      };
+    }
+    if (input.kind === 'file') {
+      await input.loadResponseFile();
+      return {
+        ...base,
+        kind: input.kind,
+        responseFilePath: input.responseFilePath,
+        contentType:
+          input.contentType ?? inferContentType(input.responseFilePath),
+        loadResponseFile: input.loadResponseFile,
+      };
+    }
+    if (
+      base.allowOrigin !== undefined &&
+      (!existing || existing.kind === 'passthrough')
+    ) {
+      throw new Error(
+        'allowOrigin requires a body or upstream source on the mock.',
+      );
+    }
+    return existing ? {...existing, ...base} : {...base, kind: 'passthrough'};
   }
 
   list(filter: NetworkMockFilter = {}, owner?: object): NetworkOverride[] {
@@ -456,7 +540,19 @@ export class NetworkOverrideManager {
     }
 
     override.diagnostics.hits++;
+    if (override.abort) {
+      await this.#abortRequest(request);
+      return;
+    }
+    if (override.kind === 'passthrough') {
+      await this.#continueRequest(request);
+      return;
+    }
     try {
+      if (override.kind === 'upstream') {
+        await this.#fulfillUpstream(request, override);
+        return;
+      }
       const body = await override.loadResponseFile();
       if (this.#disposed || this.#overrides.get(override.id) !== override) {
         await this.#continueRequest(request);
@@ -467,6 +563,9 @@ export class NetworkOverrideManager {
         contentType: override.contentType,
         headers: {
           'Cache-Control': 'no-store',
+          ...(override.allowOrigin !== undefined
+            ? {'Access-Control-Allow-Origin': override.allowOrigin}
+            : {}),
         },
         body,
       });
@@ -475,20 +574,79 @@ export class NetworkOverrideManager {
         await this.#continueRequest(request);
         return;
       }
-      const message =
+      const message: string =
         typeof error === 'object' &&
         error !== null &&
         'message' in error &&
         typeof error.message === 'string'
           ? error.message
           : String(error);
-      const source = override.responseFilePath;
+      const source =
+        override.kind === 'file'
+          ? override.responseFilePath
+          : redactUrlForLogging(override.upstreamUrl);
+      const detail =
+        override.kind === 'file'
+          ? message
+          : message.replace(/https?:\/\/[^\s"'<>]+/gi, url =>
+              redactUrlForLogging(url),
+            );
       override.diagnostics.errors++;
       override.diagnostics.lastError =
-        'Failed to load ' + source + ': ' + message;
+        'Failed to load ' + source + ': ' + detail;
       logger?.('Failed to apply network mock ' + override.id);
       await this.#abortRequest(request);
     }
+  }
+
+  async #fulfillUpstream(
+    request: HTTPRequest,
+    override: StoredUpstreamNetworkOverride,
+  ): Promise<void> {
+    const method = request.method();
+    if (method !== 'GET' && method !== 'HEAD') {
+      throw new Error('Upstream mocks only support GET and HEAD requests.');
+    }
+    const headers = getRedirectHeaders(
+      new URL(request.url()),
+      new URL(override.upstreamUrl),
+      request.headers(),
+    );
+    const response = await fetchWithValidatedRedirects(
+      new URL(override.upstreamUrl),
+      {
+        policy: override.config.resolved,
+        method,
+        headers,
+      },
+    );
+    const responseHeaders: Record<string, string | string[]> = {};
+    for (const [name, value] of response.headers) {
+      if (
+        name !== 'content-encoding' &&
+        name !== 'content-length' &&
+        name !== 'set-cookie'
+      ) {
+        responseHeaders[name] = value;
+      }
+    }
+    const cookies = response.headers.getSetCookie();
+    if (cookies.length > 0) {
+      responseHeaders['set-cookie'] = cookies;
+    }
+    if (override.allowOrigin !== undefined) {
+      responseHeaders['access-control-allow-origin'] = override.allowOrigin;
+    }
+    const body = new Uint8Array(await response.arrayBuffer());
+    if (this.#disposed || this.#overrides.get(override.id) !== override) {
+      await this.#continueRequest(request);
+      return;
+    }
+    await request.respond({
+      status: response.status,
+      headers: responseHeaders,
+      body,
+    });
   }
 
   async #continueRequest(request: HTTPRequest): Promise<void> {
@@ -509,7 +667,7 @@ export class NetworkOverrideManager {
     try {
       await request.abort('failed');
     } catch (error) {
-      logger?.('Failed to abort a request after a network mock error', error);
+      logger?.('Failed to abort an intercepted network request', error);
     }
   }
 }
@@ -517,6 +675,7 @@ export class NetworkOverrideManager {
 export async function acquireNetworkOverrideManager(
   page: Page,
   owner: object,
+  config: ReadonlyServerConfig,
 ): Promise<NetworkOverrideManager> {
   if (page.isClosed()) {
     throw new Error('Cannot add a network mock to a closed page.');
@@ -534,7 +693,10 @@ export async function acquireNetworkOverrideManager(
     throw new Error('Cannot add a network mock to a closed page.');
   }
   if (!entry) {
-    entry = {manager: new NetworkOverrideManager(page), owners: new Set()};
+    entry = {
+      manager: new NetworkOverrideManager(page, config),
+      owners: new Set(),
+    };
     managersByPage.set(page, entry);
   }
   entry.owners.add(owner);

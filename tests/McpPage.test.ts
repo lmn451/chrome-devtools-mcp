@@ -37,7 +37,7 @@ import {
   createMockWebMCPTool,
 } from './mocks.js';
 import {serverHooks} from './server.js';
-import {getMockRequest, html, withMcpContext} from './utils.js';
+import {getMockRequest, html, settle, withMcpContext} from './utils.js';
 
 describe('replaceHtmlElementsWithUids', () => {
   it('does nothing for boolean schemas', () => {
@@ -434,17 +434,11 @@ describe('McpPage', () => {
           true,
         );
 
-        const requestHandler = pptrPage.on
-          .getCalls()
-          .filter(call => call.args[0] === 'request')
-          .at(-1)?.args[1];
-        if (typeof requestHandler !== 'function') {
-          throw new Error('Shared request handler was not installed.');
-        }
         const firstRequest = createMockHTTPRequest({
           url: 'https://example.com/first.js',
         });
-        await requestHandler(firstRequest);
+        pptrPage.emit('request', firstRequest);
+        await settle();
         assert.strictEqual(
           firstRequest.respond.firstCall.args[0].body,
           firstBody,
@@ -457,7 +451,8 @@ describe('McpPage', () => {
         const secondRequest = createMockHTTPRequest({
           url: 'https://example.com/second.js',
         });
-        await requestHandler(secondRequest);
+        pptrPage.emit('request', secondRequest);
+        await settle();
         assert.strictEqual(
           secondRequest.respond.firstCall.args[0].body,
           secondBody,
