@@ -9,10 +9,9 @@ import os from 'node:os';
 import path from 'node:path';
 import {describe, it} from 'node:test';
 
-import {executablePath} from 'puppeteer';
 import sinon from 'sinon';
 import {BrowserManager} from '../src/BrowserManager.js';
-import {puppeteer, type Browser} from '../src/third_party/index.js';
+import {puppeteer, type Browser} from '../src/third_party/browser.js';
 
 import {
   createMockPuppeteerBrowser,
@@ -20,6 +19,7 @@ import {
   createMockServerConfig,
 } from './mocks.js';
 import {serverHooks} from './server.js';
+import {getExecutablePath} from './utils.js';
 
 async function safeClose(browser: Browser) {
   try {
@@ -801,7 +801,7 @@ describe('browser', () => {
           headless: true,
           isolated: false,
           userDataDir: folderPath,
-          executablePath: await executablePath(),
+          executablePath: await getExecutablePath(),
         }),
       );
       const browser1 = await manager1.ensureBrowser();
@@ -812,7 +812,7 @@ describe('browser', () => {
               headless: true,
               isolated: false,
               userDataDir: folderPath,
-              executablePath: await executablePath(),
+              executablePath: await getExecutablePath(),
             }),
           );
           const browser2 = await manager2.ensureBrowser();
@@ -843,7 +843,7 @@ describe('browser', () => {
           headless: true,
           isolated: false,
           userDataDir: folderPath,
-          executablePath: await executablePath(),
+          executablePath: await getExecutablePath(),
           viewport: {
             width: 1501,
             height: 801,
@@ -878,7 +878,7 @@ describe('browser', () => {
           headless: true,
           isolated: false,
           userDataDir: folderPath,
-          executablePath: await executablePath(),
+          executablePath: await getExecutablePath(),
           chromeArg: ['--remote-debugging-port=0'],
         }),
       );
@@ -918,7 +918,7 @@ describe('browser', () => {
           createMockServerConfig({
             headless: true,
             isolated: true,
-            executablePath: await executablePath(),
+            executablePath: await getExecutablePath(),
             blockedUrlPattern: ['*://*:*/blocked.html'],
           }),
         );
@@ -963,7 +963,7 @@ describe('browser', () => {
           createMockServerConfig({
             headless: true,
             isolated: true,
-            executablePath: await executablePath(),
+            executablePath: await getExecutablePath(),
             allowedUrlPattern: ['*://*:*/allowed.html'],
           }),
         );

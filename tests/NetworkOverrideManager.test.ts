@@ -14,7 +14,7 @@ import {
   acquireNetworkOverrideManager,
   releaseNetworkOverrideManager,
 } from '../src/NetworkOverrideManager.js';
-import {CdpFrame} from '../src/third_party/index.js';
+import {CdpFrame} from '../src/third_party/browser.js';
 import {
   createMockHTTPRequest,
   createMockPuppeteerPage,
