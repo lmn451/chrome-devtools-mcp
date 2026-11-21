@@ -21,7 +21,7 @@ import {
   type TraceResult,
   traceResultIsSuccess,
 } from '../../src/processors/PerformanceTrace.js';
-import {DevTools} from '../../src/third_party/index.js';
+import {DevTools} from '../../src/third_party/browser.js';
 import {
   finishPageClose,
   PERFORMANCE_TRACE_GLOBAL_LOCK_BUSY_MESSAGE,
@@ -795,7 +795,7 @@ describe('performance', () => {
             return Promise.resolve(rawData);
           });
 
-        const clock = sinon.useFakeTimers();
+        const clock = sinon.useFakeTimers({toFake: ['setTimeout']});
         const handlerPromise = startTrace(args).handler(
           {
             params: {reload: true, autoStop: true},

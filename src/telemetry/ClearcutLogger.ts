@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import crypto from 'node:crypto';
 import process from 'node:process';
 
 import {DAEMON_CLIENT_NAME} from '../daemon/utils.js';
@@ -24,10 +25,15 @@ import {
   type ChromeDevToolsMcpExtension,
   McpClient,
   type FlagUsage,
+  type LoggingAttrs,
   WatchdogMessageType,
   OsType,
   type ToolInvocation,
 } from './types.js';
+import {
+  DEFAULT_CLEARCUT_ENDPOINT,
+  sendToClearcut,
+} from './watchdog/ClearcutSender.js';
 import {WatchdogClient} from './WatchdogClient.js';
 import type {DevToolsData} from '../tools/ToolDefinition.js';
 
@@ -77,7 +83,8 @@ export interface ClearcutLoggerOptions {
   appVersion: string;
   persistence: Persistence;
   logFile?: string;
-  watchdogClient?: WatchdogClient;
+  createWatchdogClient?: () => WatchdogClient;
+  sendToClearcut?: typeof sendToClearcut;
   clearcutEndpoint?: string;
   clearcutForceFlushIntervalMs?: number;
   clearcutIncludePidHeader?: boolean;
@@ -127,7 +134,10 @@ function getMcpClient(clientName: string): McpClient {
 
 export class ClearcutLogger {
   #persistence: Persistence;
-  #watchdog: WatchdogClient;
+  #loggingAttrs: LoggingAttrs;
+  #createWatchdogClient: () => WatchdogClient;
+  #watchdog?: WatchdogClient;
+  #sendToClearcut: typeof sendToClearcut;
   #mcpClient: McpClient;
   #rawClientName?: string;
   #state?: LocalState;
@@ -151,17 +161,23 @@ export class ClearcutLogger {
 
   private constructor(options: ClearcutLoggerOptions) {
     this.#persistence = options.persistence;
-    this.#watchdog =
-      options.watchdogClient ??
-      new WatchdogClient({
-        parentPid: process.pid,
-        appVersion: options.appVersion,
-        osType: detectOsType(),
-        logFile: options.logFile,
-        clearcutEndpoint: options.clearcutEndpoint,
-        clearcutForceFlushIntervalMs: options.clearcutForceFlushIntervalMs,
-        clearcutIncludePidHeader: options.clearcutIncludePidHeader,
-      });
+    this.#sendToClearcut = options.sendToClearcut ?? sendToClearcut;
+    this.#loggingAttrs = {
+      appVersion: options.appVersion,
+      osType: detectOsType(),
+      sessionId: crypto.randomUUID(),
+      clearcutEndpoint: options.clearcutEndpoint ?? DEFAULT_CLEARCUT_ENDPOINT,
+    };
+    this.#createWatchdogClient =
+      options.createWatchdogClient ??
+      (() =>
+        new WatchdogClient({
+          ...this.#loggingAttrs,
+          parentPid: process.pid,
+          logFile: options.logFile,
+          clearcutForceFlushIntervalMs: options.clearcutForceFlushIntervalMs,
+          clearcutIncludePidHeader: options.clearcutIncludePidHeader,
+        }));
     this.#mcpClient = McpClient.MCP_CLIENT_UNSPECIFIED;
     void this.#persistence
       .loadState()
@@ -207,6 +223,35 @@ export class ClearcutLogger {
     return ext;
   }
 
+  // Spawns the watchdog process on the first event that needs it.
+  #getWatchdog(): WatchdogClient {
+    this.#watchdog ??= this.#createWatchdogClient();
+    return this.#watchdog;
+  }
+
+  // Sends one event from this process without going through the watchdog.
+  async #sendDirectly(payload: ChromeDevToolsMcpExtension): Promise<void> {
+    const {appVersion, osType, sessionId, clearcutEndpoint} =
+      this.#loggingAttrs;
+    const event: ChromeDevToolsMcpExtension = {
+      ...this.#addMcpClient(payload),
+      session_id: sessionId,
+      app_version: appVersion,
+      os_type: osType,
+    };
+    try {
+      const result = await this.#sendToClearcut(
+        [{event, timestamp: Date.now()}],
+        {clearcutEndpoint, includePidHeader: false},
+      );
+      if (!result.success) {
+        logger?.('Failed to send telemetry event:', JSON.stringify(result));
+      }
+    } catch (error) {
+      logger?.('Error sending telemetry event:', error);
+    }
+  }
+
   async logToolInvocation(args: {
     toolName: string;
     params: ShapeOutput<zod.ZodRawShape>;
@@ -240,20 +285,17 @@ export class ClearcutLogger {
       };
     }
 
-    this.#watchdog.send({
+    this.#getWatchdog().send({
       type: WatchdogMessageType.LOG_EVENT,
       payload: this.#addMcpClient({tool_invocation}, args.clientName),
     });
   }
 
   async logServerStart(flagUsage: FlagUsage): Promise<void> {
-    this.#watchdog.send({
-      type: WatchdogMessageType.LOG_EVENT,
-      payload: this.#addMcpClient({
-        server_start: {
-          flag_usage: flagUsage,
-        },
-      }),
+    await this.#sendDirectly({
+      server_start: {
+        flag_usage: flagUsage,
+      },
     });
   }
 
@@ -264,17 +306,15 @@ export class ClearcutLogger {
       if (shouldLogDailyActive(this.#state)) {
         const daysSince = calculateDaysSince(this.#state.lastActive);
 
-        this.#watchdog.send({
-          type: WatchdogMessageType.LOG_EVENT,
-          payload: this.#addMcpClient({
-            daily_active: {
-              days_since_last_active: bucketizeDaysSince(daysSince),
-            },
-          }),
+        const sent = this.#sendDirectly({
+          daily_active: {
+            days_since_last_active: bucketizeDaysSince(daysSince),
+          },
         });
 
         this.#state.lastActive = new Date().toISOString();
         await this.#persistence.saveState(this.#state);
+        await sent;
       }
     } catch (err) {
       logger?.('Error in logDailyActiveIfNeeded:', err);
@@ -285,7 +325,7 @@ export class ClearcutLogger {
     errorCode: ErrorCode;
     toolName?: string;
   }): Promise<void> {
-    this.#watchdog.send({
+    this.#getWatchdog().send({
       type: WatchdogMessageType.LOG_EVENT,
       payload: this.#addMcpClient({
         server_error: {
@@ -333,7 +373,7 @@ export class ClearcutLogger {
 
     const daysSinceToolCall = calculateDaysSince(state.lastToolCall, now);
 
-    this.#watchdog.send({
+    this.#getWatchdog().send({
       type: WatchdogMessageType.LOG_EVENT,
       payload: this.#addMcpClient(
         {

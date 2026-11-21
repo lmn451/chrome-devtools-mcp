@@ -17,7 +17,8 @@ import {
   type HTTPRequest,
   type Page,
   type PageEvents as PuppeteerPageEvents,
-} from '../third_party/index.js';
+  type RemoteException,
+} from '../third_party/browser.js';
 import {
   createIdGenerator,
   stableIdSymbol,
@@ -40,6 +41,26 @@ export class UncaughtError {
     this.details = details;
     this.targetId = targetId;
     this.session = session;
+  }
+
+  /**
+   * Builds an `UncaughtError` from a Puppeteer `exception` event, or returns
+   * `undefined` when the raw exception details are not available.
+   */
+  static fromException(
+    exception: RemoteException,
+    targetId: string,
+    session: CDPSession,
+  ): UncaughtError | undefined {
+    const details: Protocol.Runtime.ExceptionDetails | undefined =
+      // @ts-expect-error use internal Puppeteer API to get raw exception details.
+      exception._rawExceptionDetails();
+    if (!details) {
+      return undefined;
+    }
+    // Keep the exception object alive so its stack and cause resolve later.
+    exception.handle()?.move();
+    return new UncaughtError(details, targetId, session);
   }
 }
 
@@ -285,7 +306,7 @@ class PageEventSubscriber {
     this.#resetIssueAggregator();
     this.#page.on('framenavigated', this.#onFrameNavigated);
     this.#page.on('issue', this.#onIssueAdded);
-    this.#session.on('Runtime.exceptionThrown', this.#onExceptionThrown);
+    this.#page.on('exception', this.#onException);
     this.#attachFrameNavigatedWithinDocumentListener();
   }
 
@@ -295,7 +316,7 @@ class PageEventSubscriber {
     this.#detachFrameNavigatedWithinDocumentListener();
     this.#page.off('framenavigated', this.#onFrameNavigated);
     this.#page.off('issue', this.#onIssueAdded);
-    this.#session.off('Runtime.exceptionThrown', this.#onExceptionThrown);
+    this.#page.off('exception', this.#onException);
     if (this.#issueAggregator) {
       this.#issueAggregator.removeEventListener(
         DevTools.IssueAggregatorEvents.AGGREGATED_ISSUE_UPDATED,
@@ -314,11 +335,15 @@ class PageEventSubscriber {
     this.#page.emit('devtoolsAggregatedIssue', event.data);
   };
 
-  #onExceptionThrown = (event: Protocol.Runtime.ExceptionThrownEvent): void => {
-    this.#page.emit(
-      'uncaughtError',
-      new UncaughtError(event.exceptionDetails, this.#targetId, this.#session),
+  #onException = (exception: RemoteException): void => {
+    const error = UncaughtError.fromException(
+      exception,
+      this.#targetId,
+      this.#session,
     );
+    if (error) {
+      this.#page.emit('uncaughtError', error);
+    }
   };
 
   // On navigation, we reset issue aggregation.
@@ -368,7 +393,7 @@ class PageEventSubscriber {
 
   #onIssueAdded = (inspectorIssue: Issue): void => {
     try {
-      // @ts-expect-error The types are missmatched but they
+      // @ts-expect-error The types are mismatched but they
       // are coming from CDP
       if (!DevTools.isIssueCodeSupported(inspectorIssue.code)) {
         return;
@@ -379,7 +404,7 @@ class PageEventSubscriber {
         inspectorIssue,
       )[0];
       if (!issue) {
-        logger?.('No issue mapping for for the issue: ', inspectorIssue.code);
+        logger?.('No issue mapping for the issue: ', inspectorIssue.code);
         return;
       }
 
